@@ -22,6 +22,7 @@ from timeline import TimelineBar, clock, seconds_of
 TILE_SIZE = (480, 360)
 FOCUS_SIZE = (1024, 768)
 PREROLL = 3
+HARDWARE_DECODE = sys.platform == 'win32'
 CAPTURES = config.captures_dir()
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
@@ -37,7 +38,7 @@ class StreamWorker(QThread):
     frame_ready = Signal(int, int, QImage)
     state_changed = Signal(int, int, str)
 
-    def __init__(self, token, slot, url, size, duration=None, restart=True):
+    def __init__(self, token, slot, url, size, duration=None, restart=True, hardware=False):
         super().__init__()
         self.token = token
         self.slot = slot
@@ -45,6 +46,7 @@ class StreamWorker(QThread):
         self.width, self.height = size
         self.duration = duration
         self.restart = restart
+        self.hardware = hardware
         self.running = True
         self.proc = None
 
@@ -66,6 +68,9 @@ class StreamWorker(QThread):
                 image = QImage(data, self.width, self.height, stride, QImage.Format_BGR888)
                 self.frame_ready.emit(self.token, self.slot, image.copy())
             self._kill()
+            if first and self.hardware:
+                self.hardware = False
+                continue
             if not self.restart:
                 if self.running:
                     self.state_changed.emit(self.token, self.slot, 'ended')
@@ -77,11 +82,15 @@ class StreamWorker(QThread):
     def _command(self):
         cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
                '-rtsp_transport', 'tcp', '-fflags', 'nobuffer', '-flags', 'low_delay',
-               '-analyzeduration', '500000', '-i', self.url, '-an']
+               '-analyzeduration', '500000']
+        chain = 'scale=%d:%d,setsar=1' % (self.width, self.height)
+        if self.hardware:
+            cmd += ['-hwaccel', 'd3d11va', '-hwaccel_output_format', 'd3d11']
+            chain = 'hwdownload,format=nv12,' + chain
+        cmd += ['-i', self.url, '-an']
         if self.duration:
             cmd += ['-t', str(int(self.duration))]
-        return cmd + ['-vf', 'scale=%d:%d,setsar=1' % (self.width, self.height),
-                      '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
+        return cmd + ['-vf', chain, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
 
     def stop(self):
         self.running = False
@@ -245,10 +254,10 @@ class LiveView(QWidget):
         for index, channel in enumerate(self.channels):
             self.start_worker(index, self.dvr.live_url(channel, sub=True), TILE_SIZE)
 
-    def start_worker(self, slot, url, size):
+    def start_worker(self, slot, url, size, hardware=False):
         token = self.next_token
         self.next_token += 1
-        worker = StreamWorker(token, slot, url, size)
+        worker = StreamWorker(token, slot, url, size, hardware=hardware)
         worker.frame_ready.connect(self.on_frame)
         worker.state_changed.connect(self.on_state)
         self.workers[token] = worker
@@ -299,7 +308,8 @@ class LiveView(QWidget):
             tile.setVisible(index == slot)
             if index != slot:
                 tile.has_frame = False
-        self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=False), FOCUS_SIZE)
+        self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=False),
+                          FOCUS_SIZE, hardware=HARDWARE_DECODE)
 
     def toggle_audio(self, slot):
         if self.audio.slot == slot:
@@ -650,7 +660,7 @@ class PlaybackView(QWidget):
         self.timeline.set_position(mark)
         self.worker = StreamWorker(
             0, 0, self.dvr.playback_url(self.current_channel(), start, end),
-            FOCUS_SIZE, duration=duration, restart=False)
+            FOCUS_SIZE, duration=duration, restart=False, hardware=HARDWARE_DECODE)
         self.worker.frame_ready.connect(self.on_frame)
         self.worker.state_changed.connect(self.on_state)
         self.worker.start()

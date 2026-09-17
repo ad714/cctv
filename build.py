@@ -10,8 +10,14 @@ NAME = 'CCTV'
 def main():
     for folder in ('build', 'dist'):
         path = os.path.join(HERE, folder)
-        if os.path.isdir(path):
+        if not os.path.isdir(path):
+            continue
+        try:
             shutil.rmtree(path)
+        except PermissionError:
+            print('Cannot clean %s - %s.exe is still running.' % (path, NAME))
+            print('Quit it from the tray icon, then run this again.')
+            return 1
 
     command = [
         sys.executable, '-m', 'PyInstaller',

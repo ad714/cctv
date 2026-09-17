@@ -18,6 +18,8 @@ work, but only this model has actually been verified.
 - All cameras in a grid, click any tile to expand it to full resolution
 - Per-camera audio (one at a time), snapshot, and record-to-file
 - Sub-streams in the grid, main stream when expanded, so six cameras cost very little
+- Expanded and playback streams use **D3D11VA hardware decode** (about 40% less CPU),
+  falling back to software automatically if the GPU or driver cannot do it
 
 **Playback tab**
 - Calendar showing which days have footage
@@ -147,6 +149,10 @@ to lose and hard to rediscover:
 - `searchID` in `ContentMgmt/search` must be a real UUID; other strings are rejected
 - `analyzeduration` dominates stream startup; lowering it takes first frame from 2.2s to
   1.2s, but going too low makes the stream fail to open at all
+- Hardware decode helps only the main stream. On the 352x288 sub-streams every hwaccel
+  tested dropped 25 fps to 18.8 fps for a trivial CPU saving, so the grid stays software.
+  `dxva2` looked best on a single sample but halved the framerate on 2 of 3 repeats;
+  `d3d11va` with an explicit `hwdownload` was the only consistent option
 - Motion detection already ships with `targetType: human,vehicle` enabled, but the VMD
   trigger has no `center` notification by default, so events never reach the alert
   stream until you add one
