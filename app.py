@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QDate, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPixmap,
                            QPolygon, QTextCharFormat)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDateEdit, QGridLayout,
@@ -741,8 +742,9 @@ class PlaybackView(QWidget):
             self.exporter.wait(2000)
 
 
-APP_MUTEX = 'Global\\HikViewerSingleInstance'
-_mutex_handle = None
+IPC_NAME = 'HikViewerShowRequest'
+MUTEX_NAME = 'Local\\HikViewerSingleInstance'
+_instance_mutex = None
 
 
 def app_icon():
@@ -762,25 +764,27 @@ def app_icon():
     return QIcon(pixmap)
 
 
-def claim_single_instance():
-    global _mutex_handle
+def already_running():
+    global _instance_mutex
     if sys.platform != 'win32':
-        return True
+        return False
     kernel32 = ctypes.windll.kernel32
-    _mutex_handle = kernel32.CreateMutexW(None, False, APP_MUTEX)
-    return kernel32.GetLastError() != 183
+    _instance_mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    return kernel32.GetLastError() == 183
 
 
-def raise_existing_window(title='CCTV'):
-    if sys.platform != 'win32':
-        return False
-    user32 = ctypes.windll.user32
-    handle = user32.FindWindowW(None, title)
-    if not handle:
-        return False
-    user32.ShowWindow(handle, 9)
-    user32.SetForegroundWindow(handle)
-    return True
+def ask_running_instance_to_show(attempts=10):
+    for _ in range(attempts):
+        socket = QLocalSocket()
+        socket.connectToServer(IPC_NAME)
+        if socket.waitForConnected(1000):
+            socket.write(b'show')
+            socket.waitForBytesWritten(1000)
+            socket.flush()
+            socket.waitForDisconnected(1000)
+            return True
+        QThread.msleep(500)
+    return False
 
 
 class MainWindow(QMainWindow):
@@ -830,14 +834,29 @@ class MainWindow(QMainWindow):
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
 
+        QLocalServer.removeServer(IPC_NAME)
+        self.ipc = QLocalServer(self)
+        self.ipc.newConnection.connect(self.on_ipc_request)
+        self.ipc.listen(IPC_NAME)
+
+    def on_ipc_request(self):
+        connection = self.ipc.nextPendingConnection()
+        if connection is not None:
+            connection.readyRead.connect(connection.deleteLater)
+        self.restore_window()
+
     def on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.restore_window()
 
     def restore_window(self):
-        self.showNormal()
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
         self.raise_()
         self.activateWindow()
+        self.update()
 
     def quit_app(self):
         self.quitting = True
@@ -868,6 +887,8 @@ class MainWindow(QMainWindow):
                                   QSystemTrayIcon.Information, 4000)
             return
         self.tray.hide()
+        self.ipc.close()
+        QLocalServer.removeServer(IPC_NAME)
         self.watcher.stop()
         self.watcher.wait(2000)
         self.playback.shutdown()
@@ -884,9 +905,8 @@ def main():
     qt = QApplication(sys.argv)
     qt.setApplicationName('CCTV')
     qt.setWindowIcon(app_icon())
-    if not claim_single_instance():
-        if not raise_existing_window():
-            QMessageBox.information(None, 'CCTV', 'CCTV is already running.')
+    if already_running():
+        ask_running_instance_to_show()
         return 0
     qt.setQuitOnLastWindowClosed(False)
     missing = [tool for tool in ('ffmpeg', 'ffplay') if not find_tool(tool)]
