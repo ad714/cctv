@@ -18,10 +18,8 @@ work, but only this model has actually been verified.
 - All cameras in a grid, click any tile to expand it to full resolution
 - Per-camera audio (one at a time), snapshot, and record-to-file
 - Sub-streams in the grid, main stream when expanded, so six cameras cost very little
-- Expanded and playback streams use **D3D11VA hardware decode**, falling back to
-  software automatically if the GPU or driver cannot do it
-- Frames travel as raw **yuv420p** straight from FFmpeg to an OpenGL shader, so colour
-  conversion and scaling happen on the GPU instead of the CPU
+- Expanded and playback streams use **D3D11VA hardware decode** (about 40% less CPU),
+  falling back to software automatically if the GPU or driver cannot do it
 
 **Playback tab**
 - Calendar showing which days have footage
@@ -158,14 +156,6 @@ to lose and hard to rediscover:
 - Motion detection already ships with `targetType: human,vehicle` enabled, but the VMD
   trigger has no `center` notification by default, so events never reach the alert
   stream until you add one
-- ISAPI reports the main stream as `960x1080`, but FFmpeg decodes `960x1088` (HEVC pads
-  to the coded size). Use `ffprobe`'s `coded_width`/`coded_height` to size raw frame
-  reads, never the ISAPI value, or the frames desync
-- Emitting `bgr24` with a `scale` filter cost roughly 5x more CPU than raw `yuv420p` at
-  native size (20.6% vs 3.7% of a core for six sub-streams) because ~65% of the work was
-  colour conversion, not decoding
-- `PySide6/opengl32sw.dll` (~20 MB) must stay in the bundle: it is Qt's software OpenGL
-  fallback and the video widget needs a GL context on machines without usable GPU GL
 
 ---
 
@@ -173,8 +163,6 @@ to lose and hard to rediscover:
 
 ```
 app.py        UI, live grid, playback, tray, entry point
-glvideo.py    OpenGL video widget (yuv420p -> BT.601 shader)
-runtime.py    logging, crash handlers, job object, ffmpeg helpers, backoff
 hik.py        ISAPI and RTSP client (device info, search, playback, clips, events)
 timeline.py   Zoomable timeline widget
 events.py     Motion episode store and DVR alert-stream watcher

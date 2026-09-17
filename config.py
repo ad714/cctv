@@ -88,8 +88,7 @@ def load():
     except OSError:
         return None
     return {'ip': data['ip'], 'user': data['user'], 'password': password,
-            'channels': data.get('channels') or [],
-            'sizes': data.get('sizes') or None}
+            'channels': data.get('channels') or []}
 
 
 def _write(payload):
@@ -131,15 +130,6 @@ def remember_channels(channels):
     if data is None or data.get('channels') == list(channels):
         return False
     data['channels'] = list(channels)
-    _write(data)
-    return True
-
-
-def remember_sizes(sizes):
-    data = _read()
-    if data is None or data.get('sizes') == sizes:
-        return False
-    data['sizes'] = sizes
     _write(data)
     return True
 

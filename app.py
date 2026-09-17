@@ -5,25 +5,24 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QDate, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import (QAction, QColor, QIcon, QPainter, QPixmap, QPolygon,
-                           QTextCharFormat)
+from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPixmap,
+                           QPolygon, QTextCharFormat)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDateEdit, QGridLayout,
                                QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSizePolicy, QStatusBar, QSystemTrayIcon,
                                QTabWidget, QVBoxLayout, QWidget)
-
-from concurrent.futures import ThreadPoolExecutor
 
 import config
 import hik
 import login
 import runtime
 from events import EventStore, EventWatcher
-from glvideo import GLVideoWidget
 from timeline import TimelineBar, clock, seconds_of
 
+TILE_SIZE = (480, 360)
+FOCUS_SIZE = (1024, 768)
 PREROLL = 3
 STALL_SECONDS = 20
 HARDWARE_DECODE = sys.platform == 'win32'
@@ -38,7 +37,7 @@ QPushButton:checked { background:#2b4a34; color:#7fe0a0; border-color:#3d6b4a; }
 
 
 class StreamWorker(QThread):
-    frame_ready = Signal(int, int, object, int, int)
+    frame_ready = Signal(int, int, QImage)
     state_changed = Signal(int, int, str)
 
     def __init__(self, token, slot, url, size, duration=None, restart=True, hardware=False):
@@ -54,7 +53,8 @@ class StreamWorker(QThread):
         self.proc = None
 
     def run(self):
-        expected = self.width * self.height * 3 // 2
+        stride = self.width * 3
+        expected = stride * self.height
         attempt = 0
         while self.running:
             self.state_changed.emit(self.token, self.slot, 'connecting')
@@ -68,8 +68,8 @@ class StreamWorker(QThread):
                     self.state_changed.emit(self.token, self.slot, 'live')
                     first = False
                     attempt = 0
-                self.frame_ready.emit(self.token, self.slot, data,
-                                      self.width, self.height)
+                image = QImage(data, self.width, self.height, stride, QImage.Format_BGR888)
+                self.frame_ready.emit(self.token, self.slot, image.copy())
             self._kill()
             if first and self.hardware:
                 runtime.log.warning('ch-slot %d: hardware decode failed, using software',
@@ -89,12 +89,13 @@ class StreamWorker(QThread):
                 self.msleep(int(delay * 1000))
 
     def _command(self):
-        args = (['ffmpeg']
-                + runtime.rtsp_input(self.url, hardware=self.hardware,
-                                     duration=self.duration) + ['-an'])
+        chain = 'scale=%d:%d,setsar=1' % (self.width, self.height)
         if self.hardware:
-            args += ['-vf', 'hwdownload,format=nv12,format=yuv420p']
-        return args + ['-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-']
+            chain = 'hwdownload,format=nv12,' + chain
+        return (['ffmpeg']
+                + runtime.rtsp_input(self.url, hardware=self.hardware,
+                                     duration=self.duration)
+                + ['-an', '-vf', chain, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'])
 
     def stop(self):
         self.running = False
@@ -142,6 +143,40 @@ class AudioPlayer:
         self.slot = None
 
 
+class VideoLabel(QLabel):
+    clicked = Signal()
+
+    def __init__(self, title):
+        super().__init__()
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(160, 120)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.setStyleSheet('background:#101014; color:#6f6f80; border:1px solid #26262e;')
+        self.setText('%s\nconnecting' % title)
+        self.frame = None
+
+    def set_frame(self, image):
+        self.frame = image
+        self.update()
+
+    def paintEvent(self, event):
+        if self.frame is None:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#101014'))
+        area = self.rect().adjusted(1, 1, -1, -1)
+        size = self.frame.size().scaled(area.size(), Qt.KeepAspectRatio)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform,
+                              size.width() * 1.15 < self.frame.width())
+        painter.drawImage(QRect(area.x() + (area.width() - size.width()) // 2,
+                                area.y() + (area.height() - size.height()) // 2,
+                                size.width(), size.height()), self.frame)
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+
 class Tile(QWidget):
     focus_requested = Signal(int)
     audio_requested = Signal(int)
@@ -158,9 +193,7 @@ class Tile(QWidget):
         self.state = 'connecting'
         self.has_frame = False
 
-        self.video = GLVideoWidget(self.title)
-        self.video.setMinimumSize(160, 120)
-        self.video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.video = VideoLabel(self.title)
         self.video.clicked.connect(lambda: self.focus_requested.emit(slot))
 
         self.name = QLabel(self.title)
@@ -192,26 +225,24 @@ class Tile(QWidget):
         layout.addWidget(self.video, 1)
         layout.addLayout(bar)
 
-    def show_frame(self, data, width, height):
+    def show_frame(self, image):
         self.frames += 1
         self.has_frame = True
-        self.video.set_frame(data, width, height)
+        self.video.set_frame(image)
 
     def show_state(self, state):
         self.state = state
         if state != 'live' and not self.has_frame:
-            self.video.set_placeholder('%s\n%s' % (self.title, state))
+            self.video.setText('%s\n%s' % (self.title, state))
 
 
 class LiveView(QWidget):
     status = Signal(str)
 
-    def __init__(self, dvr, channels, sizes):
+    def __init__(self, dvr, channels):
         super().__init__()
         self.dvr = dvr
         self.channels = channels
-        self.sub_size = tuple(sizes['sub'])
-        self.main_size = tuple(sizes['main'])
         self.workers = {}
         self.slot_token = {}
         self.pending = set()
@@ -254,7 +285,7 @@ class LiveView(QWidget):
         for tile in self.tiles.values():
             tile.setVisible(True)
         for index, channel in enumerate(self.channels):
-            self.start_worker(index, self.dvr.live_url(channel, sub=True), self.sub_size)
+            self.start_worker(index, self.dvr.live_url(channel, sub=True), TILE_SIZE)
 
     def start_worker(self, slot, url, size, hardware=False):
         token = self.next_token
@@ -301,8 +332,8 @@ class LiveView(QWidget):
                 tile.setVisible(True)
             for index, channel in enumerate(self.channels):
                 if index != slot:
-                    self.start_worker(index, self.dvr.live_url(channel, sub=True), self.sub_size)
-            self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=True), self.sub_size)
+                    self.start_worker(index, self.dvr.live_url(channel, sub=True), TILE_SIZE)
+            self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=True), TILE_SIZE)
             return
         self.focused = slot
         self.apply_stretch()
@@ -312,7 +343,7 @@ class LiveView(QWidget):
             if index != slot:
                 tile.has_frame = False
         self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=False),
-                          self.main_size, hardware=HARDWARE_DECODE)
+                          FOCUS_SIZE, hardware=HARDWARE_DECODE)
 
     def toggle_audio(self, slot):
         if self.audio.slot == slot:
@@ -366,7 +397,7 @@ class LiveView(QWidget):
             self.note = 'recording %s' % os.path.basename(path)
         self.tiles[slot].record_button.setChecked(slot in self.recorders)
 
-    def on_frame(self, token, slot, data, width, height):
+    def on_frame(self, token, slot, image):
         if token in self.pending:
             self.pending.discard(token)
             previous = self.slot_token.get(slot)
@@ -378,7 +409,7 @@ class LiveView(QWidget):
         self.last_frame[slot] = time.monotonic()
         tile = self.tiles.get(slot)
         if tile is not None and tile.isVisible():
-            tile.show_frame(data, width, height)
+            tile.show_frame(image)
 
     def on_state(self, token, slot, state):
         if self.slot_token.get(slot) != token:
@@ -470,11 +501,10 @@ class ExportWorker(QThread):
 class PlaybackView(QWidget):
     status = Signal(str)
 
-    def __init__(self, dvr, channels, store, main_size):
+    def __init__(self, dvr, channels, store):
         super().__init__()
         self.dvr = dvr
         self.channels = channels
-        self.main_size = tuple(main_size)
         self.store = store
         self.episodes = []
         self.hit_index = None
@@ -542,10 +572,8 @@ class PlaybackView(QWidget):
         self.export_button.setStyleSheet(BUTTON_STYLE)
         bar.addWidget(self.export_button)
 
-        self.video = GLVideoWidget('Playback')
-        self.video.setMinimumSize(320, 240)
-        self.video.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.video.set_placeholder('pick a day, then click the timeline')
+        self.video = VideoLabel('Playback')
+        self.video.setText('pick a day, then click the timeline')
 
         self.timeline = TimelineBar()
         self.timeline.seek_requested.connect(self.seek_to)
@@ -711,7 +739,7 @@ class PlaybackView(QWidget):
         self.timeline.set_position(mark)
         self.worker = StreamWorker(
             0, 0, self.dvr.playback_url(self.current_channel(), start, end),
-            self.main_size, duration=duration, restart=False, hardware=HARDWARE_DECODE)
+            FOCUS_SIZE, duration=duration, restart=False, hardware=HARDWARE_DECODE)
         self.worker.frame_ready.connect(self.on_frame)
         self.worker.state_changed.connect(self.on_state)
         self.worker.start()
@@ -849,7 +877,7 @@ def ask_running_instance_to_show(attempts=10):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, dvr, channels, sizes):
+    def __init__(self, dvr, channels):
         super().__init__()
         self.setWindowTitle('CCTV')
         self.resize(1480, 880)
@@ -858,8 +886,8 @@ class MainWindow(QMainWindow):
         self.quitting = False
 
         self.store = EventStore()
-        self.live = LiveView(dvr, channels, sizes)
-        self.playback = PlaybackView(dvr, channels, self.store, sizes['main'])
+        self.live = LiveView(dvr, channels)
+        self.playback = PlaybackView(dvr, channels, self.store)
         self.live.status.connect(self.show_status)
         self.playback.status.connect(self.show_status)
 
@@ -1015,16 +1043,7 @@ def main():
             return 1
         config.remember_channels(channels)
 
-    sizes = saved.get('sizes')
-    if not sizes:
-        with ThreadPoolExecutor(2) as pool:
-            sub = pool.submit(dvr.stream_size, channels[0], True)
-            main = pool.submit(dvr.stream_size, channels[0], False)
-            sizes = {'sub': list(sub.result()), 'main': list(main.result())}
-        config.remember_sizes(sizes)
-        runtime.log.info('probed stream sizes %s', sizes)
-
-    window = MainWindow(dvr, channels, sizes)
+    window = MainWindow(dvr, channels)
     window.show()
 
     def reconcile(found):

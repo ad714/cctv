@@ -68,15 +68,6 @@ class Dvr:
         from urllib.parse import quote
         return quote(self.user, safe=''), quote(self.password, safe='')
 
-    def stream_size(self, channel, sub=True, timeout=25):
-        out = subprocess.run(
-            ['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',
-             '-show_entries', 'stream=coded_width,coded_height', '-of', 'csv=p=0',
-             self.live_url(channel, sub=sub)],
-            capture_output=True, text=True, timeout=timeout).stdout.strip()
-        width, _, height = out.partition(',')
-        return int(width), int(height)
-
     def live_url(self, channel, sub=True):
         user, password = self._creds_in_url()
         return 'rtsp://%s:%s@%s:554/Streaming/Channels/%d0%d' % (
