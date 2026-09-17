@@ -905,6 +905,11 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().setStyleSheet('color:#8a8a99;')
 
+        self.upkeep = QTimer(self)
+        self.upkeep.timeout.connect(self.housekeeping)
+        self.upkeep.start(30 * 60 * 1000)
+        QTimer.singleShot(5000, self.housekeeping)
+
         self.watcher = EventWatcher(dvr, self.store)
         self.watcher.detected.connect(self.on_detected)
         self.watcher.start()
@@ -933,6 +938,14 @@ class MainWindow(QMainWindow):
         if connection is not None:
             connection.readyRead.connect(connection.deleteLater)
         self.restore_window()
+
+    def housekeeping(self):
+        runtime.log.info('memory %.0f MB, %d detection(s) stored',
+                         runtime.process_rss_mb(), self.store.counts()[0])
+        job = CallWorker(self.store.prune)
+        job.done.connect(lambda *_: None)
+        self.chores = job
+        job.start()
 
     def on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
@@ -976,6 +989,7 @@ class MainWindow(QMainWindow):
                                   'Motion is still being recorded. Quit from the tray icon.',
                                   QSystemTrayIcon.Information, 4000)
             return
+        self.upkeep.stop()
         self.tray.hide()
         self.ipc.close()
         QLocalServer.removeServer(IPC_NAME)

@@ -7,6 +7,37 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = 'CCTV'
 
 
+PRUNE_FILES = [
+    # Qt's software OpenGL fallback: nothing in this app creates a GL context
+    'PySide6/opengl32sw.dll',
+    # Qt's own OpenSSL: QtNetwork is only used for local named pipes, never TLS
+    'PySide6/libcrypto-3-x64.dll',
+    'PySide6/libssl-3-x64.dll',
+    'PySide6/plugins/tls/qopensslbackend.dll',
+]
+PRUNE_DIRS = [
+    # the UI is English-only
+    'PySide6/translations',
+]
+
+
+def prune(internal):
+    freed = 0
+    for name in PRUNE_DIRS:
+        path = os.path.join(internal, *name.split('/'))
+        if os.path.isdir(path):
+            freed += sum(os.path.getsize(os.path.join(r, f))
+                         for r, _d, fs in os.walk(path) for f in fs)
+            shutil.rmtree(path)
+    for name in PRUNE_FILES:
+        path = os.path.join(internal, *name.split('/'))
+        if os.path.isfile(path):
+            freed += os.path.getsize(path)
+            os.remove(path)
+    print('Pruned %.0f MB of unused Qt payload' % (freed / 1048576))
+    return freed
+
+
 def main():
     for folder in ('build', 'dist'):
         path = os.path.join(HERE, folder)
@@ -40,6 +71,8 @@ def main():
     result = subprocess.run(command, cwd=HERE)
     if result.returncode != 0:
         return result.returncode
+
+    prune(os.path.join(HERE, 'dist', NAME, '_internal'))
 
     target = os.path.join(HERE, 'dist', NAME, '%s.exe' % NAME)
     if not os.path.exists(target):

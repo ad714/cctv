@@ -172,6 +172,30 @@ def stop_process(proc, graceful=False, timeout=5):
         log.debug('stop_process: %s', exc)
 
 
+def process_rss_mb():
+    if not WINDOWS:
+        return 0.0
+    class Counters(ctypes.Structure):
+        _fields_ = [('cb', ctypes.c_uint32), ('PageFaultCount', ctypes.c_uint32),
+                    ('PeakWorkingSetSize', ctypes.c_size_t),
+                    ('WorkingSetSize', ctypes.c_size_t),
+                    ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                    ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                    ('PagefileUsage', ctypes.c_size_t),
+                    ('PeakPagefileUsage', ctypes.c_size_t)]
+    counters = Counters()
+    counters.cb = ctypes.sizeof(counters)
+    psapi = ctypes.WinDLL('psapi', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    if not psapi.GetProcessMemoryInfo(ctypes.c_void_p(kernel32.GetCurrentProcess()),
+                                      ctypes.byref(counters), counters.cb):
+        return 0.0
+    return counters.WorkingSetSize / 1048576.0
+
+
 def backoff_delay(attempt, cap=BACKOFF_CAP):
     ceiling = min(cap, BACKOFF_BASE * (2 ** min(attempt, 10)))
     return random.uniform(0.0, ceiling)

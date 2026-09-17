@@ -10,6 +10,7 @@ import runtime
 
 DB_PATH = config.data_path('events.db')
 EPISODE_GAP = timedelta(seconds=12)
+RETENTION_DAYS = 180
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -35,6 +36,7 @@ class EventStore:
     def _connect(self):
         conn = sqlite3.connect(self.path, timeout=10)
         conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA journal_size_limit=8388608')
         return conn
 
     def record(self, channel, moment, target):
@@ -72,6 +74,15 @@ class EventStore:
                  end.isoformat(timespec='seconds'))).fetchall()
         return [(datetime.fromisoformat(a), datetime.fromisoformat(b), c, d)
                 for a, b, c, d in rows]
+
+    def prune(self, days=RETENTION_DAYS):
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec='seconds')
+        with self.lock, self._connect() as conn:
+            removed = conn.execute(
+                'DELETE FROM detections WHERE started < ?', (cutoff,)).rowcount
+        if removed:
+            runtime.log.info('pruned %d detection(s) older than %d days', removed, days)
+        return removed
 
     def counts(self):
         with self.lock, self._connect() as conn:
