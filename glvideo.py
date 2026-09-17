@@ -78,6 +78,14 @@ class GLVideoWidget(QOpenGLWidget):
         else:
             runtime.log.debug('video shader ready for %s', self.title)
 
+    def resizeGL(self, width, height):
+        self._set_viewport()
+
+    def _set_viewport(self):
+        ratio = self.devicePixelRatioF()
+        self.context().functions().glViewport(
+            0, 0, max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio)))
+
     def _ensure_textures(self):
         sizes = [(self.frame_width, self.frame_height),
                  (self.frame_width // 2, self.frame_height // 2),
@@ -109,9 +117,7 @@ class GLVideoWidget(QOpenGLWidget):
             offset += count
 
     def _quad(self):
-        width, height = self.width(), self.height()
-        if width <= 0 or height <= 0:
-            return None
+        width, height = max(1, self.width()), max(1, self.height())
         target = self.aspect
         if width / height > target:
             x = (target * height) / width
@@ -123,6 +129,7 @@ class GLVideoWidget(QOpenGLWidget):
 
     def paintGL(self):
         functions = self.context().functions()
+        self._set_viewport()
         functions.glClearColor(0.063, 0.063, 0.078, 1.0)
         functions.glClear(0x00004000)
 
@@ -139,15 +146,11 @@ class GLVideoWidget(QOpenGLWidget):
             self.dirty = False
 
         corners = self._quad()
-        if corners is None:
-            return
 
         self.program.bind()
         for index, name in enumerate(('plane_y', 'plane_u', 'plane_v')):
-            functions.glActiveTexture(0x84C0 + index)
-            self.textures[index].bind()
+            self.textures[index].bind(index)
             self.program.setUniformValue1i(self.program.uniformLocation(name), index)
-        functions.glActiveTexture(0x84C0)
 
         position = self.program.attributeLocation('position')
         uv = self.program.attributeLocation('uv')
@@ -158,6 +161,8 @@ class GLVideoWidget(QOpenGLWidget):
         functions.glDrawArrays(0x0005, 0, 4)
         self.program.disableAttributeArray(position)
         self.program.disableAttributeArray(uv)
+        for index in range(3):
+            self.textures[index].release(index)
         self.program.release()
 
     def _paint_placeholder(self):
