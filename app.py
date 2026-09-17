@@ -4,7 +4,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QDate, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDate, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPixmap,
                            QPolygon, QTextCharFormat)
@@ -140,6 +140,25 @@ class VideoLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setStyleSheet('background:#101014; color:#6f6f80; border:1px solid #26262e;')
         self.setText('%s\nconnecting' % title)
+        self.frame = None
+
+    def set_frame(self, image):
+        self.frame = image
+        self.update()
+
+    def paintEvent(self, event):
+        if self.frame is None:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor('#101014'))
+        area = self.rect().adjusted(1, 1, -1, -1)
+        size = self.frame.size().scaled(area.size(), Qt.KeepAspectRatio)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform,
+                              size.width() * 1.15 < self.frame.width())
+        painter.drawImage(QRect(area.x() + (area.width() - size.width()) // 2,
+                                area.y() + (area.height() - size.height()) // 2,
+                                size.width(), size.height()), self.frame)
 
     def mousePressEvent(self, event):
         self.clicked.emit()
@@ -196,8 +215,7 @@ class Tile(QWidget):
     def show_frame(self, image):
         self.frames += 1
         self.has_frame = True
-        self.video.setPixmap(QPixmap.fromImage(image).scaled(
-            self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video.set_frame(image)
 
     def show_state(self, state):
         self.state = state
@@ -678,8 +696,7 @@ class PlaybackView(QWidget):
         self.play_started = None
 
     def on_frame(self, token, slot, image):
-        self.video.setPixmap(QPixmap.fromImage(image).scaled(
-            self.video.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video.set_frame(image)
 
     def on_state(self, token, slot, state):
         if state == 'ended':
