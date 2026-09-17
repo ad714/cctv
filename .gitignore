@@ -1,0 +1,28 @@
+# Credentials and local state - never commit
+.hikenv
+config.json
+events.db
+events.db-wal
+events.db-shm
+config-backup/
+
+# Captured media
+captures/
+*.mp4
+*.jpg
+*.jpeg
+
+# Build output
+build/
+dist/
+*.spec
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Large binaries and models
+*.exe
+*.pt
+*.onnx
