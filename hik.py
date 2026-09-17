@@ -1,12 +1,13 @@
 import os
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime, timedelta
 from xml.etree import ElementTree
 
-import requests
-from requests.auth import HTTPDigestAuth
+import urllib.error
+import urllib.request
 
 NS = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
 DEFAULT_IP = '192.168.1.6'
@@ -23,6 +24,35 @@ def load_env(path=None):
     return kv
 
 
+class Response:
+    """Minimal stand-in for the parts of a requests Response this app uses."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.status = raw.status
+        self._body = None
+
+    @property
+    def content(self):
+        if self._body is None:
+            self._body = self.raw.read()
+        return self._body
+
+    @property
+    def text(self):
+        return self.content.decode('utf-8', 'replace')
+
+    def iter_lines(self):
+        for line in self.raw:
+            yield line.rstrip()
+
+    def close(self):
+        try:
+            self.raw.close()
+        except Exception:
+            pass
+
+
 class Dvr:
     def __init__(self, ip=DEFAULT_IP, user=None, password=None):
         if user is None or password is None:
@@ -32,18 +62,32 @@ class Dvr:
         self.ip = ip
         self.user = user
         self.password = password
-        self.session = requests.Session()
-        self.session.auth = HTTPDigestAuth(user, password)
+        self._local = threading.local()
+
+    @property
+    def opener(self):
+        # urllib's digest handler keeps per-request state and is not thread safe,
+        # so every thread gets its own opener.
+        existing = getattr(self._local, 'opener', None)
+        if existing is None:
+            manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+            manager.add_password(None, 'http://%s' % self.ip, self.user, self.password)
+            existing = urllib.request.build_opener(
+                urllib.request.HTTPDigestAuthHandler(manager))
+            self._local.opener = existing
+        return existing
+
+    def _open(self, path, data=None, headers=None, timeout=20):
+        request = urllib.request.Request('http://%s%s' % (self.ip, path),
+                                         data=data, headers=headers or {})
+        return Response(self.opener.open(request, timeout=timeout))
 
     def get(self, path, stream=False, timeout=20):
-        resp = self.session.get('http://%s%s' % (self.ip, path), stream=stream, timeout=timeout)
-        resp.raise_for_status()
-        return resp
+        return self._open(path, timeout=timeout)
 
     def post_xml(self, path, body, timeout=30):
-        resp = self.session.post('http://%s%s' % (self.ip, path), data=body.encode('utf-8'),
-                                 headers={'Content-Type': 'application/xml'}, timeout=timeout)
-        resp.raise_for_status()
+        resp = self._open(path, data=body.encode('utf-8'),
+                          headers={'Content-Type': 'application/xml'}, timeout=timeout)
         return ElementTree.fromstring(resp.content)
 
     def device_info(self):

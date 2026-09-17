@@ -45,7 +45,8 @@ work, but only this model has actually been verified.
   ```
 - A Hikvision DVR/NVR reachable on the network, with ISAPI and RTSP enabled
 
-For running from source you also need Python 3.10+.
+For running from source you also need Python 3.10+. The only third-party dependency is
+PySide6; everything else is the standard library.
 
 ---
 
@@ -80,8 +81,9 @@ python -m venv .venv
 .venv\Scripts\python.exe build.py
 ```
 
-Output lands in `dist\CCTV\CCTV.exe` (about 98 MB, folder is self-contained apart from
-FFmpeg).
+Output lands in `dist\CCTV\CCTV.exe` (about 69 MB, folder is self-contained apart from
+FFmpeg). The build prunes Qt payload the app never uses: the software OpenGL fallback,
+Qt's translations, and Qt's own OpenSSL.
 
 ---
 
@@ -109,7 +111,8 @@ and then the encrypted config is used.
 | What | Where |
 |---|---|
 | Credentials | `%LOCALAPPDATA%\HikViewer\config.json` |
-| Motion index | `%LOCALAPPDATA%\HikViewer\events.db` |
+| Motion index | `%LOCALAPPDATA%\HikViewer\events.db` (pruned past 180 days) |
+| Logs | `%LOCALAPPDATA%\HikViewer\cctv.log`, `crash.log` |
 | Snapshots, recordings, exported clips | `%USERPROFILE%\Videos\CCTV` |
 
 These live outside the app folder on purpose, so rebuilding or replacing the app never
@@ -156,6 +159,9 @@ to lose and hard to rediscover:
 - Motion detection already ships with `targetType: human,vehicle` enabled, but the VMD
   trigger has no `center` notification by default, so events never reach the alert
   stream until you add one
+- `urllib`'s digest auth handler keeps per-request state and is **not thread safe**.
+  Sharing one opener across the parallel camera probe silently dropped cameras from the
+  results; each thread needs its own opener
 
 ---
 
