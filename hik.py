@@ -1,5 +1,6 @@
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime, timedelta
 from xml.etree import ElementTree
@@ -49,18 +50,19 @@ class Dvr:
         root = ElementTree.fromstring(self.get('/ISAPI/System/deviceInfo').content)
         return {child.tag.split('}')[-1]: child.text for child in root}
 
-    def snapshot(self, channel):
-        return self.get('/ISAPI/Streaming/channels/%d01/picture' % channel).content
+    def snapshot(self, channel, timeout=20):
+        return self.get('/ISAPI/Streaming/channels/%d01/picture' % channel,
+                        timeout=timeout).content
 
-    def live_channels(self, candidates=range(1, 9), min_bytes=15000):
-        live = []
-        for channel in candidates:
+    def live_channels(self, candidates=range(1, 9), min_bytes=15000, timeout=4):
+        def probe(channel):
             try:
-                if len(self.snapshot(channel)) >= min_bytes:
-                    live.append(channel)
-            except requests.RequestException:
-                pass
-        return live
+                return channel, len(self.snapshot(channel, timeout=timeout)) >= min_bytes
+            except Exception:
+                return channel, False
+        candidates = list(candidates)
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            return [c for c, ok in sorted(pool.map(probe, candidates)) if ok]
 
     def _creds_in_url(self):
         from urllib.parse import quote
@@ -102,30 +104,37 @@ class Dvr:
         return days
 
     def clip(self, channel, start, end, out_path):
+        import runtime
         seconds = int((end - start).total_seconds())
         if seconds <= 0:
             raise ValueError('end must be after start')
-        cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-rtsp_transport', 'tcp',
-               '-i', self.playback_url(channel, start, end),
-               '-t', str(seconds), '-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k',
-               '-aspect', '4:3', '-movflags', '+frag_keyframe+empty_moov', out_path]
-        subprocess.run(cmd, check=True)
+        cmd = (['ffmpeg', '-y']
+               + runtime.rtsp_input(self.playback_url(channel, start, end),
+                                    duration=seconds)
+               + ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k', '-aspect', '4:3',
+                  '-movflags', '+frag_keyframe+empty_moov', out_path])
+        subprocess.run(cmd, check=True, creationflags=runtime.NO_WINDOW)
         return out_path
 
-    def events(self, timeout=None):
+    def events(self, timeout=None, on_open=None):
         resp = self.get('/ISAPI/Event/notification/alertStream', stream=True, timeout=timeout)
+        if on_open is not None:
+            on_open(resp)
         chunk = []
-        for line in resp.iter_lines():
-            if line is None:
-                continue
-            raw = line.decode('utf-8', 'replace') if isinstance(line, bytes) else line
-            if raw.startswith('--') and chunk:
-                parsed = _parse_alert('\n'.join(chunk))
-                chunk = []
-                if parsed:
-                    yield parsed
-            else:
-                chunk.append(raw)
+        try:
+            for line in resp.iter_lines():
+                if line is None:
+                    continue
+                raw = line.decode('utf-8', 'replace') if isinstance(line, bytes) else line
+                if raw.startswith('--') and chunk:
+                    parsed = _parse_alert('\n'.join(chunk))
+                    chunk = []
+                    if parsed:
+                        yield parsed
+                else:
+                    chunk.append(raw)
+        finally:
+            resp.close()
 
 
 SEARCH_BODY = """<?xml version="1.0" encoding="utf-8"?>

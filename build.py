@@ -21,7 +21,7 @@ def main():
 
     command = [
         sys.executable, '-m', 'PyInstaller',
-        '--noconfirm', '--clean', '--windowed',
+        '--noconfirm', '--clean', '--windowed', '--noupx',
         '--name', NAME,
         '--icon', os.path.join(HERE, 'icon.ico'),
         '--exclude-module', 'torch',

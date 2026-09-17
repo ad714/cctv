@@ -78,10 +78,8 @@ def unprotect(stored):
 
 
 def load():
-    try:
-        with open(config_path(), encoding='utf-8') as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
+    data = _read()
+    if data is None:
         return None
     if not data.get('ip') or not data.get('user') or not data.get('secret'):
         return None
@@ -89,20 +87,51 @@ def load():
         password = unprotect(data['secret'])
     except OSError:
         return None
-    return {'ip': data['ip'], 'user': data['user'], 'password': password}
+    return {'ip': data['ip'], 'user': data['user'], 'password': password,
+            'channels': data.get('channels') or []}
 
 
-def save(ip, user, password):
-    payload = {'ip': ip, 'user': user, 'secret': protect(password)}
+def _write(payload):
     path = config_path()
-    with open(path, 'w', encoding='utf-8') as handle:
+    temp = path + '.tmp'
+    with open(temp, 'w', encoding='utf-8') as handle:
         json.dump(payload, handle, indent=2)
+    if WINDOWS:
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(path, 0x80)
+        except Exception:
+            pass
+    os.replace(temp, path)
     if WINDOWS:
         try:
             ctypes.windll.kernel32.SetFileAttributesW(path, 0x02)
         except Exception:
             pass
     return path
+
+
+def _read():
+    try:
+        with open(config_path(), encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def save(ip, user, password, channels=None):
+    payload = {'ip': ip, 'user': user, 'secret': protect(password)}
+    if channels:
+        payload['channels'] = list(channels)
+    return _write(payload)
+
+
+def remember_channels(channels):
+    data = _read()
+    if data is None or data.get('channels') == list(channels):
+        return False
+    data['channels'] = list(channels)
+    _write(data)
+    return True
 
 
 def forget():

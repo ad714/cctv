@@ -2,6 +2,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QDate, QPoint, QRect, Qt, QThread, QTimer, Signal
@@ -16,15 +17,16 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDateEdit, QGridLayout,
 import config
 import hik
 import login
+import runtime
 from events import EventStore, EventWatcher
 from timeline import TimelineBar, clock, seconds_of
 
 TILE_SIZE = (480, 360)
 FOCUS_SIZE = (1024, 768)
 PREROLL = 3
+STALL_SECONDS = 20
 HARDWARE_DECODE = sys.platform == 'win32'
 CAPTURES = config.captures_dir()
-NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
 
 BUTTON_STYLE = """
 QPushButton { background:#1b1b22; color:#9a9aa8; border:1px solid #2c2c36;
@@ -53,10 +55,10 @@ class StreamWorker(QThread):
     def run(self):
         stride = self.width * 3
         expected = stride * self.height
+        attempt = 0
         while self.running:
             self.state_changed.emit(self.token, self.slot, 'connecting')
-            self.proc = subprocess.Popen(self._command(), stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            self.proc = runtime.spawn(self._command(), stdout=subprocess.PIPE)
             first = True
             while self.running:
                 data = self.proc.stdout.read(expected)
@@ -65,10 +67,13 @@ class StreamWorker(QThread):
                 if first:
                     self.state_changed.emit(self.token, self.slot, 'live')
                     first = False
+                    attempt = 0
                 image = QImage(data, self.width, self.height, stride, QImage.Format_BGR888)
                 self.frame_ready.emit(self.token, self.slot, image.copy())
             self._kill()
             if first and self.hardware:
+                runtime.log.warning('ch-slot %d: hardware decode failed, using software',
+                                    self.slot)
                 self.hardware = False
                 continue
             if not self.restart:
@@ -76,34 +81,46 @@ class StreamWorker(QThread):
                     self.state_changed.emit(self.token, self.slot, 'ended')
                 return
             if self.running:
+                delay = runtime.backoff_delay(attempt)
+                attempt += 1
+                runtime.log.info('slot %d stream ended, retry %d in %.1fs',
+                                 self.slot, attempt, delay)
                 self.state_changed.emit(self.token, self.slot, 'reconnecting')
-                self.msleep(2000)
+                self.msleep(int(delay * 1000))
 
     def _command(self):
-        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
-               '-rtsp_transport', 'tcp', '-fflags', 'nobuffer', '-flags', 'low_delay',
-               '-analyzeduration', '500000']
         chain = 'scale=%d:%d,setsar=1' % (self.width, self.height)
         if self.hardware:
-            cmd += ['-hwaccel', 'd3d11va', '-hwaccel_output_format', 'd3d11']
             chain = 'hwdownload,format=nv12,' + chain
-        cmd += ['-i', self.url, '-an']
-        if self.duration:
-            cmd += ['-t', str(int(self.duration))]
-        return cmd + ['-vf', chain, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
+        return (['ffmpeg']
+                + runtime.rtsp_input(self.url, hardware=self.hardware,
+                                     duration=self.duration)
+                + ['-an', '-vf', chain, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'])
 
     def stop(self):
         self.running = False
         self._kill()
 
     def _kill(self):
-        if self.proc is not None:
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=2)
-            except Exception:
-                pass
-            self.proc = None
+        runtime.stop_process(self.proc)
+        self.proc = None
+
+
+class CallWorker(QThread):
+    done = Signal(object, object)
+
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            self.done.emit(self.func(*self.args, **self.kwargs), None)
+        except Exception as exc:
+            runtime.log.warning('%s failed: %s', getattr(self.func, '__name__', '?'), exc)
+            self.done.emit(None, exc)
 
 
 class AudioPlayer:
@@ -113,19 +130,15 @@ class AudioPlayer:
 
     def play(self, slot, url):
         self.stop()
-        self.proc = subprocess.Popen(
-            ['ffplay', '-nodisp', '-loglevel', 'error', '-vn', '-rtsp_transport', 'tcp',
+        self.proc = runtime.spawn(
+            ['ffplay', '-nodisp', '-loglevel', 'error', '-vn',
+             '-rtsp_transport', 'tcp', '-timeout', str(runtime.SOCKET_TIMEOUT_US),
              '-fflags', 'nobuffer', '-i', url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            stdout=subprocess.DEVNULL)
         self.slot = slot
 
     def stop(self):
-        if self.proc is not None:
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=2)
-            except Exception:
-                pass
+        runtime.stop_process(self.proc)
         self.proc = None
         self.slot = None
 
@@ -239,6 +252,8 @@ class LiveView(QWidget):
         self.audio = AudioPlayer()
         self.focused = None
         self.note = ''
+        self.last_frame = {}
+        self.jobs = []
 
         self.grid = QGridLayout(self)
         self.grid.setSpacing(6)
@@ -283,6 +298,7 @@ class LiveView(QWidget):
             self.pending.add(token)
         else:
             self.slot_token[slot] = token
+        self.last_frame[slot] = time.monotonic()
         worker.start()
 
     def retire(self, token):
@@ -343,33 +359,40 @@ class LiveView(QWidget):
         channel = self.channels[slot]
         path = os.path.join(CAPTURES, 'snap-ch%d-%s.jpg' % (
             channel, datetime.now().strftime('%Y%m%d-%H%M%S')))
-        try:
+
+        def grab():
+            data = self.dvr.snapshot(channel, timeout=8)
             with open(path, 'wb') as fh:
-                fh.write(self.dvr.snapshot(channel))
-            self.note = 'saved %s' % os.path.basename(path)
-        except Exception as exc:
-            self.note = 'snapshot failed: %s' % exc
+                fh.write(data)
+            return path
+
+        self.note = 'saving snapshot...'
+        job = CallWorker(grab)
+        job.done.connect(lambda result, error: self._snapshot_done(result, error))
+        self.jobs.append(job)
+        job.start()
+
+    def _snapshot_done(self, result, error):
+        if error is None and result:
+            self.note = 'saved %s' % os.path.basename(result)
+        else:
+            self.note = 'snapshot failed: %s' % error
 
     def toggle_record(self, slot):
         channel = self.channels[slot]
         if slot in self.recorders:
             proc, path = self.recorders.pop(slot)
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+            runtime.stop_process(proc, graceful=True)
+            runtime.log.info('stopped recording %s', os.path.basename(path))
             self.note = 'stopped %s' % os.path.basename(path)
         else:
             path = os.path.join(CAPTURES, 'live-ch%d-%s.mp4' % (
                 channel, datetime.now().strftime('%Y%m%d-%H%M%S')))
-            proc = subprocess.Popen(
-                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-rtsp_transport', 'tcp',
-                 '-i', self.dvr.live_url(channel, sub=False),
-                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k', '-aspect', '4:3',
-                 '-movflags', '+frag_keyframe+empty_moov', path],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            proc = runtime.spawn(
+                ['ffmpeg'] + runtime.rtsp_input(self.dvr.live_url(channel, sub=False))
+                + ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k', '-aspect', '4:3',
+                   '-movflags', '+frag_keyframe+empty_moov', path],
+                stdout=subprocess.DEVNULL, stdin=subprocess.PIPE)
             self.recorders[slot] = (proc, path)
             self.note = 'recording %s' % os.path.basename(path)
         self.tiles[slot].record_button.setChecked(slot in self.recorders)
@@ -383,6 +406,7 @@ class LiveView(QWidget):
             self.slot_token[slot] = token
         if self.slot_token.get(slot) != token:
             return
+        self.last_frame[slot] = time.monotonic()
         tile = self.tiles.get(slot)
         if tile is not None and tile.isVisible():
             tile.show_frame(image)
@@ -394,8 +418,28 @@ class LiveView(QWidget):
         if tile is not None:
             tile.show_state(state)
 
+    def check_stalls(self):
+        now = time.monotonic()
+        for slot, token in list(self.slot_token.items()):
+            worker = self.workers.get(token)
+            if worker is None or not worker.running:
+                continue
+            since = now - self.last_frame.get(slot, now)
+            if since < STALL_SECONDS:
+                continue
+            runtime.log.warning('slot %d stalled %.0fs with no frame, restarting',
+                                slot, since)
+            self.note = 'camera %d stalled, restarting' % self.channels[slot]
+            url, size = worker.url, (worker.width, worker.height)
+            hardware = worker.hardware
+            self.slot_token.pop(slot, None)
+            self.retire(token)
+            self.start_worker(slot, url, size, hardware=hardware)
+
     def tick(self):
         self.retiring = [w for w in self.retiring if not w.isFinished()]
+        self.jobs = [j for j in self.jobs if j.isRunning()]
+        self.check_stalls()
         if not self.isVisible():
             return
         parts = []
@@ -424,15 +468,14 @@ class LiveView(QWidget):
         self.audio.stop()
         for slot in list(self.recorders):
             proc, _ = self.recorders.pop(slot)
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+            runtime.stop_process(proc, graceful=True)
         for worker in list(self.workers.values()) + list(self.retiring):
             worker.stop()
         for worker in list(self.workers.values()) + list(self.retiring):
             worker.wait(3000)
+        for job in self.jobs:
+            job.wait(3000)
+        self.jobs.clear()
         self.workers.clear()
 
 
@@ -467,6 +510,7 @@ class PlaybackView(QWidget):
         self.hit_index = None
         self.worker = None
         self.exporter = None
+        self.day_job = None
         self.audio = AudioPlayer()
         self.view_note = ''
         self.play_from = None
@@ -543,9 +587,15 @@ class PlaybackView(QWidget):
         layout.addWidget(self.video, 1)
         layout.addWidget(self.timeline)
 
+        self.loaded = False
         self.ticker = QTimer(self)
         self.ticker.timeout.connect(self.tick)
         self.ticker.start(500)
+
+    def ensure_loaded(self):
+        if self.loaded:
+            return
+        self.loaded = True
         self.reload_day()
 
     def on_view_changed(self, start, end):
@@ -586,22 +636,37 @@ class PlaybackView(QWidget):
         channel = self.current_channel()
         day = self.current_day()
         start = datetime.combine(day, datetime.min.time())
-        end = start + timedelta(days=1)
-        try:
-            segments = self.dvr.search(channel, start, end, max_results=200)
-        except Exception as exc:
-            segments = []
-            self.note = 'search failed: %s' % exc
-        self.timeline.set_segments(segments, day)
         self.timeline.set_position(None)
         self.timeline.clear_selection()
-        total = sum(b - a for a, b in self.timeline.segments)
         self.load_detections()
         self.label_cameras()
+        self.note = 'loading %s ...' % day.isoformat()
+        if self.day_job is not None and self.day_job.isRunning():
+            return
+
+        def fetch():
+            return (self.dvr.search(channel, start, start + timedelta(days=1),
+                                    max_results=200),
+                    self.dvr.record_days(channel, day.year, day.month))
+
+        self.day_job = CallWorker(fetch)
+        self.day_job.done.connect(
+            lambda result, error: self._day_loaded(day, result, error))
+        self.day_job.start()
+
+    def _day_loaded(self, day, result, error):
+        if day != self.current_day():
+            return
+        if error is not None or result is None:
+            self.note = 'could not load %s: %s' % (day.isoformat(), error)
+            return
+        segments, days = result
+        self.timeline.set_segments(segments, day)
+        self.mark_calendar(days)
+        total = sum(b - a for a, b in self.timeline.segments)
         self.note = '%s   %d segment(s)   %.1f h recorded   %d motion event(s)' % (
             day.isoformat(), len(self.timeline.segments), total / 3600.0,
             len(self.episodes))
-        self.mark_calendar()
 
     def label_cameras(self):
         day = self.current_day()
@@ -642,15 +707,11 @@ class PlaybackView(QWidget):
             index + 1, len(marks), start.strftime('%H:%M:%S'),
             label or 'unclassified', hits)
 
-    def mark_calendar(self):
+    def mark_calendar(self, days):
         widget = self.date.calendarWidget()
-        if widget is None:
+        if widget is None or not days:
             return
         day = self.current_day()
-        try:
-            days = self.dvr.record_days(self.current_channel(), day.year, day.month)
-        except Exception:
-            return
         available = QTextCharFormat()
         available.setForeground(QColor('#7fe0a0'))
         for number, _kind in days:
@@ -765,8 +826,9 @@ class PlaybackView(QWidget):
     def shutdown(self):
         self.ticker.stop()
         self.stop_playback()
-        if self.exporter is not None:
-            self.exporter.wait(2000)
+        for job in (self.exporter, self.day_job):
+            if job is not None:
+                job.wait(2000)
 
 
 IPC_NAME = 'HikViewerShowRequest'
@@ -891,12 +953,13 @@ class MainWindow(QMainWindow):
 
     def on_detected(self, channel, target, moment):
         self.live.note = 'motion ch%d %s %s' % (channel, target or '', moment.strftime('%H:%M:%S'))
-        if (channel == self.playback.current_channel()
+        if (self.playback.loaded and channel == self.playback.current_channel()
                 and moment.date() == self.playback.current_day()):
             self.playback.load_detections()
 
     def on_tab_changed(self, index):
         if self.tabs.widget(index) is self.playback:
+            self.playback.ensure_loaded()
             self.playback.load_detections()
         else:
             self.playback.suspend()
@@ -928,8 +991,25 @@ def find_tool(name):
     return which(name) is not None
 
 
+class ChannelScan(QThread):
+    done = Signal(object)
+
+    def __init__(self, dvr):
+        super().__init__()
+        self.dvr = dvr
+
+    def run(self):
+        try:
+            self.done.emit(self.dvr.live_channels())
+        except Exception as exc:
+            runtime.log.warning('channel rescan failed: %s', exc)
+
+
 def main():
+    runtime.setup_logging()
+    runtime.claim_job_object()
     qt = QApplication(sys.argv)
+    runtime.install_qt_message_handler()
     qt.setApplicationName('CCTV')
     qt.setWindowIcon(app_icon())
     if already_running():
@@ -949,12 +1029,33 @@ def main():
     dvr = login.obtain_dvr(here)
     if dvr is None:
         return 0
-    channels = dvr.live_channels()
-    if not channels:
-        QMessageBox.critical(None, 'CCTV', 'Connected to %s but no cameras are sending video.' % dvr.ip)
-        return 1
+
+    saved = config.load() or {}
+    channels = saved.get('channels') or []
+    if channels:
+        runtime.log.info('using cached channel list %s', channels)
+    else:
+        channels = dvr.live_channels()
+        if not channels:
+            QMessageBox.critical(
+                None, 'CCTV',
+                'Connected to %s but no cameras are sending video.' % dvr.ip)
+            return 1
+        config.remember_channels(channels)
+
     window = MainWindow(dvr, channels)
     window.show()
+
+    def reconcile(found):
+        if found and list(found) != list(channels):
+            runtime.log.info('camera list changed %s -> %s', channels, found)
+            config.remember_channels(found)
+            window.statusBar().showMessage(
+                'Camera list changed to %s - restart to apply' % found, 15000)
+    window.scan = ChannelScan(dvr)
+    window.scan.done.connect(reconcile)
+    window.scan.start()
+
     return qt.exec()
 
 

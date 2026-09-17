@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from PySide6.QtCore import QThread, Signal
 
 import config
+import runtime
 
 DB_PATH = config.data_path('events.db')
 EPISODE_GAP = timedelta(seconds=12)
@@ -88,11 +89,14 @@ class EventWatcher(QThread):
         self.dvr = dvr
         self.store = store
         self.running = True
+        self.response = None
 
     def run(self):
+        attempt = 0
         while self.running:
             try:
-                for event in self.dvr.events(timeout=120):
+                for event in self.dvr.events(timeout=120, on_open=self._opened):
+                    attempt = 0
                     if not self.running:
                         return
                     if event['type'] != 'VMD':
@@ -102,8 +106,21 @@ class EventWatcher(QThread):
             except Exception as exc:
                 if not self.running:
                     return
+                delay = runtime.backoff_delay(attempt, cap=60.0)
+                attempt += 1
+                runtime.log.warning('alert stream dropped (%s), retry %d in %.1fs',
+                                    exc, attempt, delay)
                 self.trouble.emit(str(exc))
-                self.msleep(4000)
+                self.msleep(int(delay * 1000))
+
+    def _opened(self, response):
+        self.response = response
 
     def stop(self):
         self.running = False
+        response, self.response = self.response, None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
