@@ -5,6 +5,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+BOOT = time.monotonic()
+
 from PySide6.QtCore import QDate, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPixmap,
@@ -20,6 +22,26 @@ import login
 import runtime
 from events import EventStore, EventWatcher
 from timeline import TimelineBar, clock, seconds_of
+
+SPLASH_MIN_SECONDS = 1.1
+
+try:
+    import pyi_splash
+except ImportError:
+    pyi_splash = None
+
+
+def close_splash():
+    if pyi_splash is None:
+        return
+    linger = SPLASH_MIN_SECONDS - (time.monotonic() - BOOT)
+    if linger > 0:
+        time.sleep(linger)
+    try:
+        if pyi_splash.is_alive():
+            pyi_splash.close()
+    except Exception:
+        pass
 
 TILE_SIZE = (480, 360)
 FOCUS_SIZE = (1024, 768)
@@ -1027,11 +1049,13 @@ def main():
     qt.setApplicationName('CCTV')
     qt.setWindowIcon(app_icon())
     if already_running():
+        close_splash()
         ask_running_instance_to_show()
         return 0
     qt.setQuitOnLastWindowClosed(False)
     missing = [tool for tool in ('ffmpeg', 'ffplay') if not find_tool(tool)]
     if missing:
+        close_splash()
         QMessageBox.critical(
             None, 'CCTV',
             'Missing required tool(s): %s\n\n'
@@ -1040,8 +1064,9 @@ def main():
         return 1
     here = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
             else os.path.dirname(os.path.abspath(__file__)))
-    dvr = login.obtain_dvr(here)
+    dvr = login.obtain_dvr(here, close_splash)
     if dvr is None:
+        close_splash()
         return 0
 
     saved = config.load() or {}
@@ -1051,6 +1076,7 @@ def main():
     else:
         channels = dvr.live_channels()
         if not channels:
+            close_splash()
             QMessageBox.critical(
                 None, 'CCTV',
                 'Connected to %s but no cameras are sending video.' % dvr.ip)
@@ -1058,6 +1084,7 @@ def main():
         config.remember_channels(channels)
 
     window = MainWindow(dvr, channels)
+    close_splash()
     window.show()
 
     def reconcile(found):
