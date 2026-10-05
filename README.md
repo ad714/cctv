@@ -54,7 +54,7 @@ PySide6; everything else is the standard library.
 
 1. Download the release, or build it yourself (below)
 2. Run `CCTV.exe`
-3. Enter the DVR address, username and password on first launch
+3. Pick your DVR from the list it finds and enter the username and password
 
 Optional: create a Desktop shortcut and pin it to the taskbar
 
@@ -81,15 +81,31 @@ python -m venv .venv
 .venv\Scripts\python.exe build.py
 ```
 
-Output lands in `dist\CCTV\CCTV.exe` (about 69 MB, folder is self-contained apart from
+Output lands in `dist\CCTV\CCTV.exe` (about 73 MB, folder is self-contained apart from
 FFmpeg). The build prunes Qt payload the app never uses: the software OpenGL fallback,
 Qt's translations, and Qt's own OpenSSL.
+
+The splash screen shown while the app loads is `splash.png`, regenerated with
+`python tools\make_splash.py`.
+
+---
+
+## Finding the DVR
+
+On first run the app asks the network for Hikvision devices (SADP, the same discovery
+Hikvision's own tools use) and lists what answers, so you do not need to know the IP
+address. Pick the device, enter the username and password, and that is the whole setup.
+
+The serial number is stored alongside the address and is what identifies the DVR from
+then on. If DHCP moves the DVR to a different IP, the app finds it again by serial and
+updates itself, so a fixed address or a router reservation is never required. If
+discovery is blocked on your network, the address field still accepts a typed IP.
 
 ---
 
 ## Credentials
 
-On first run you are asked for the DVR address, username and password.
+On first run you are asked for the DVR login.
 
 Credentials are **not** stored in the repo or next to the executable. They go to:
 
@@ -114,6 +130,10 @@ and then the encrypted config is used.
 | Motion index | `%LOCALAPPDATA%\HikViewer\events.db` (pruned past 180 days) |
 | Logs | `%LOCALAPPDATA%\HikViewer\cctv.log`, `crash.log` |
 | Snapshots, recordings, exported clips | `%USERPROFILE%\Videos\CCTV` |
+
+Recordings and exports are tagged `4:3`, which suits the analog cameras this was built
+against. For 16:9 cameras, add `"aspect": "16:9"` to `config.json` (or `"source"` to
+leave the stream's own ratio alone).
 
 These live outside the app folder on purpose, so rebuilding or replacing the app never
 destroys your history or your clips.

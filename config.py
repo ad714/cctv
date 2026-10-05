@@ -88,7 +88,9 @@ def load():
     except OSError:
         return None
     return {'ip': data['ip'], 'user': data['user'], 'password': password,
-            'channels': data.get('channels') or []}
+            'channels': data.get('channels') or [],
+            'serial': data.get('serial') or '',
+            'port': data.get('port') or 80}
 
 
 def _write(payload):
@@ -118,11 +120,21 @@ def _read():
         return None
 
 
-def save(ip, user, password, channels=None):
+def save(ip, user, password, channels=None, serial=None, port=80):
     payload = {'ip': ip, 'user': user, 'secret': protect(password)}
     if channels:
         payload['channels'] = list(channels)
+    if serial:
+        payload['serial'] = serial
+    if port and port != 80:
+        payload['port'] = port
     return _write(payload)
+
+
+def setting(name, default=None):
+    data = _read() or {}
+    value = data.get(name)
+    return default if value in (None, '') else value
 
 
 def remember_channels(channels):

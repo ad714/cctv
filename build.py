@@ -55,6 +55,7 @@ def main():
         '--noconfirm', '--clean', '--windowed', '--noupx',
         '--name', NAME,
         '--icon', os.path.join(HERE, 'icon.ico'),
+        '--splash', os.path.join(HERE, 'splash.png'),
         '--exclude-module', 'requests',
         '--exclude-module', 'urllib3',
         '--exclude-module', 'certifi',

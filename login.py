@@ -1,8 +1,8 @@
 import os
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QCheckBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout,
+                               QLabel, QLineEdit, QPushButton, QVBoxLayout)
 
 import config
 import hik
@@ -13,6 +13,10 @@ QLabel { color:#b0b0c0; font-size:12px; }
 QLineEdit { background:#1b1b22; color:#e0e0ea; border:1px solid #2c2c36;
             padding:5px 7px; font-size:12px; }
 QLineEdit:focus { border-color:#4d7fb8; }
+QComboBox { background:#1b1b22; color:#e0e0ea; border:1px solid #2c2c36;
+            padding:4px 7px; font-size:12px; }
+QComboBox QAbstractItemView { background:#1b1b22; color:#e0e0ea;
+                              selection-background-color:#2b4a34; }
 QCheckBox { color:#9a9aa8; font-size:11px; }
 QPushButton { background:#1b1b22; color:#c8c8d4; border:1px solid #2c2c36;
               padding:6px 16px; font-size:12px; }
@@ -22,28 +26,40 @@ QPushButton:default { background:#2b4a34; border-color:#3d6b4a; color:#9fe8bd; }
 
 
 class ProbeWorker(QThread):
-    finished_probe = Signal(bool, str)
+    finished_probe = Signal(bool, str, str)
 
-    def __init__(self, ip, user, password):
+    def __init__(self, ip, user, password, port=80):
         super().__init__()
         self.ip = ip
         self.user = user
         self.password = password
+        self.port = port
 
     def run(self):
         try:
-            dvr = hik.Dvr(self.ip, self.user, self.password)
+            dvr = hik.Dvr(self.ip, self.user, self.password, self.port)
             info = dvr.device_info()
             channels = dvr.live_channels()
             self.finished_probe.emit(True, '%s, %d camera(s) live' % (
-                info.get('model', 'device'), len(channels)))
+                info.get('model', 'device'), len(channels)),
+                info.get('serialNumber') or '')
         except Exception as exc:
             message = str(exc)
             if '401' in message:
                 message = 'rejected: wrong username or password'
             elif 'timed out' in message.lower() or 'refused' in message.lower():
                 message = 'no answer from %s' % self.ip
-            self.finished_probe.emit(False, message[:120])
+            self.finished_probe.emit(False, message[:120], '')
+
+
+class DiscoverWorker(QThread):
+    finished_scan = Signal(list)
+
+    def run(self):
+        try:
+            self.finished_scan.emit(hik.sadp())
+        except Exception:
+            self.finished_scan.emit([])
 
 
 class LoginDialog(QDialog):
@@ -54,9 +70,14 @@ class LoginDialog(QDialog):
         self.setMinimumWidth(380)
         self.result_credentials = None
         self.probe = None
+        self.devices = {}
 
         initial = initial or {}
-        self.ip = QLineEdit(initial.get('ip', '192.168.1.6'))
+        self.ip = QComboBox()
+        self.ip.setEditable(True)
+        if initial.get('ip'):
+            self.ip.addItem(initial['ip'])
+        self.ip.currentTextChanged.connect(self.describe)
         self.user = QLineEdit(initial.get('user', 'admin'))
         self.password = QLineEdit(initial.get('password', ''))
         self.password.setEchoMode(QLineEdit.Password)
@@ -69,7 +90,7 @@ class LoginDialog(QDialog):
         form.addRow('Username', self.user)
         form.addRow('Password', self.password)
 
-        self.message = QLabel('Enter the DVR login used by the Hikvision app.')
+        self.message = QLabel('Searching the network for your DVR ...')
         self.message.setWordWrap(True)
 
         self.test_button = QPushButton('Test')
@@ -94,8 +115,39 @@ class LoginDialog(QDialog):
         layout.addWidget(self.message)
         layout.addLayout(buttons)
 
+        self.finder = DiscoverWorker()
+        self.finder.finished_scan.connect(self.on_devices)
+        self.finder.start()
+
+    def on_devices(self, devices):
+        if not devices:
+            self.message.setText('No DVR answered. Enter its address manually.')
+            return
+        saved = self.ip.currentText().strip()
+        self.devices = {device['ip']: device for device in devices}
+        self.ip.clear()
+        self.ip.addItems([device['ip'] for device in devices])
+        if saved and saved not in self.devices:
+            self.ip.addItem(saved)
+        self.ip.setCurrentText(saved if saved in self.devices else devices[0]['ip'])
+        self.describe()
+
+    def describe(self):
+        if not self.devices:
+            return
+        device = self.devices.get(self.ip.currentText().strip())
+        if device is not None:
+            self.message.setText('Found %s at %s' % (device['model'], device['ip']))
+        else:
+            self.message.setText('Using the address you typed.')
+
+    def port(self):
+        device = self.devices.get(self.ip.currentText().strip())
+        return device['port'] if device else 80
+
     def values(self):
-        return self.ip.text().strip(), self.user.text().strip(), self.password.text()
+        return (self.ip.currentText().strip(), self.user.text().strip(),
+                self.password.text())
 
     def set_busy(self, busy, text):
         self.test_button.setEnabled(not busy)
@@ -108,36 +160,47 @@ class LoginDialog(QDialog):
             self.message.setText('Address and username are required.')
             return
         self.set_busy(True, 'Contacting %s ...' % ip)
-        self.probe = ProbeWorker(ip, user, password)
+        self.probe = ProbeWorker(ip, user, password, self.port())
         self.probe.finished_probe.connect(
-            lambda ok, detail: self.on_probe(ok, detail, then_accept))
+            lambda ok, detail, serial: self.on_probe(ok, detail, serial, then_accept))
         self.probe.start()
 
-    def on_probe(self, ok, detail, then_accept):
+    def on_probe(self, ok, detail, serial, then_accept):
         self.set_busy(False, ('Connected: %s' % detail) if ok else ('Failed: %s' % detail))
         if ok and then_accept:
-            self.finish()
+            self.finish(serial)
 
     def accept_credentials(self):
         self.run_test(then_accept=True)
 
-    def finish(self):
+    def finish(self, serial=''):
         ip, user, password = self.values()
-        self.result_credentials = {'ip': ip, 'user': user, 'password': password}
+        port = self.port()
+        self.result_credentials = {'ip': ip, 'user': user, 'password': password,
+                                   'serial': serial, 'port': port}
         if self.remember.isChecked():
             try:
-                config.save(ip, user, password)
+                config.save(ip, user, password, None, serial, port)
             except OSError as exc:
                 self.message.setText('Connected, but could not save: %s' % exc)
         self.accept()
 
     def closeEvent(self, event):
-        if self.probe is not None:
-            self.probe.wait(2000)
+        for worker in (self.probe, self.finder):
+            if worker is not None:
+                worker.wait(3000)
         event.accept()
 
 
-def obtain_dvr(folder):
+def remember(dvr, saved):
+    try:
+        config.save(dvr.ip, dvr.user, dvr.password,
+                    (saved or {}).get('channels'), dvr.serial, dvr.port)
+    except OSError:
+        pass
+
+
+def obtain_dvr(folder, on_prompt=None):
     saved = config.load()
     if saved is None:
         legacy = config.import_legacy(folder)
@@ -149,14 +212,27 @@ def obtain_dvr(folder):
             except Exception:
                 saved = None
     if saved is not None:
-        try:
-            dvr = hik.Dvr(saved['ip'], saved['user'], saved['password'])
-            dvr.device_info()
-            return dvr
-        except Exception:
-            pass
+        if hik.port_open(saved['ip'], saved.get('port', 80), 0.8):
+            try:
+                dvr = hik.Dvr(saved['ip'], saved['user'], saved['password'],
+                              saved.get('port', 80))
+                dvr.serial = dvr.device_info(timeout=5).get('serialNumber')
+                if dvr.serial and dvr.serial != saved.get('serial'):
+                    remember(dvr, saved)
+                return dvr
+            except Exception:
+                pass
+        found = hik.find_device(saved['user'], saved['password'],
+                                saved.get('serial'), saved['ip'])
+        if found is not None:
+            remember(found, saved)
+            return found
+    if on_prompt is not None:
+        on_prompt()
     dialog = LoginDialog(saved)
     if dialog.exec() != QDialog.Accepted or dialog.result_credentials is None:
         return None
-    found = dialog.result_credentials
-    return hik.Dvr(found['ip'], found['user'], found['password'])
+    picked = dialog.result_credentials
+    dvr = hik.Dvr(picked['ip'], picked['user'], picked['password'], picked['port'])
+    dvr.serial = picked['serial']
+    return dvr
