@@ -1,6 +1,7 @@
-import os
+import socket
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime, timedelta
@@ -10,18 +11,6 @@ import urllib.error
 import urllib.request
 
 NS = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
-DEFAULT_IP = '192.168.1.6'
-
-
-def load_env(path=None):
-    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), '.hikenv')
-    kv = {}
-    with open(path, encoding='utf-8-sig') as fh:
-        for line in fh:
-            if '=' in line and not line.strip().startswith('#'):
-                key, _, val = line.partition('=')
-                kv[key.strip()] = val.strip().strip('"').strip("'")
-    return kv
 
 
 class Response:
@@ -54,14 +43,13 @@ class Response:
 
 
 class Dvr:
-    def __init__(self, ip=DEFAULT_IP, user=None, password=None):
-        if user is None or password is None:
-            kv = load_env()
-            user = user or kv.get('HIK_USER', 'admin')
-            password = password or kv['HIK_PASS']
+    def __init__(self, ip, user, password, port=80):
         self.ip = ip
+        self.port = port
+        self.host = ip if port == 80 else '%s:%d' % (ip, port)
         self.user = user
         self.password = password
+        self.serial = None
         self._local = threading.local()
 
     @property
@@ -71,14 +59,14 @@ class Dvr:
         existing = getattr(self._local, 'opener', None)
         if existing is None:
             manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-            manager.add_password(None, 'http://%s' % self.ip, self.user, self.password)
+            manager.add_password(None, 'http://%s' % self.host, self.user, self.password)
             existing = urllib.request.build_opener(
                 urllib.request.HTTPDigestAuthHandler(manager))
             self._local.opener = existing
         return existing
 
     def _open(self, path, data=None, headers=None, timeout=20):
-        request = urllib.request.Request('http://%s%s' % (self.ip, path),
+        request = urllib.request.Request('http://%s%s' % (self.host, path),
                                          data=data, headers=headers or {})
         return Response(self.opener.open(request, timeout=timeout))
 
@@ -90,8 +78,9 @@ class Dvr:
                           headers={'Content-Type': 'application/xml'}, timeout=timeout)
         return ElementTree.fromstring(resp.content)
 
-    def device_info(self):
-        root = ElementTree.fromstring(self.get('/ISAPI/System/deviceInfo').content)
+    def device_info(self, timeout=20):
+        root = ElementTree.fromstring(
+            self.get('/ISAPI/System/deviceInfo', timeout=timeout).content)
         return {child.tag.split('}')[-1]: child.text for child in root}
 
     def snapshot(self, channel, timeout=20):
@@ -196,6 +185,135 @@ DAILY_BODY = """<?xml version="1.0" encoding="utf-8"?>
 <trackDailyParam><year>%d</year><monthOfYear>%d</monthOfYear></trackDailyParam>"""
 
 
+SADP_GROUP = '239.255.255.250'
+SADP_PORT = 37020
+
+
+def _local_subnets():
+    targets = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if address.startswith('127.') or address.startswith('169.254.'):
+                continue
+            broadcast = address.rsplit('.', 1)[0] + '.255'
+            if broadcast not in targets:
+                targets.append(broadcast)
+    except socket.gaierror:
+        pass
+    return targets
+
+
+def _parse_sadp(payload):
+    try:
+        root = ElementTree.fromstring(payload.decode('utf-8', 'replace'))
+    except ElementTree.ParseError:
+        return None
+    field = {child.tag: (child.text or '') for child in root}
+    ip = field.get('IPv4Address')
+    serial = field.get('DeviceSN')
+    if not ip or not serial:
+        return None
+    try:
+        port = int(field.get('HttpPort') or 80)
+    except ValueError:
+        port = 80
+    return {'ip': ip, 'serial': serial, 'port': port,
+            'model': field.get('DeviceDescription') or 'Hikvision device',
+            'mac': field.get('MAC') or '',
+            'dhcp': (field.get('DHCP') or '').lower() == 'true'}
+
+
+def sadp(timeout=2.0, want=None):
+    probe = ('<?xml version="1.0" encoding="utf-8"?>'
+             '<Probe><Uuid>%s</Uuid><Types>inquiry</Types></Probe>'
+             % str(uuid.uuid4()).upper()).encode('utf-8')
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    found = {}
+    try:
+        sock.bind(('', 0))
+        for target in [(SADP_GROUP, SADP_PORT)] + [(net, SADP_PORT)
+                                                   for net in _local_subnets()]:
+            try:
+                sock.sendto(probe, target)
+            except OSError:
+                continue
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            try:
+                payload, _addr = sock.recvfrom(8192)
+            except OSError:
+                break
+            device = _parse_sadp(payload)
+            if device is not None:
+                found.setdefault(device['serial'], device)
+                if want and device['serial'] == want:
+                    break
+    finally:
+        sock.close()
+    return list(found.values())
+
+
+def connect(device, user, password):
+    dvr = Dvr(device['ip'], user, password, device['port'])
+    info = dvr.device_info(timeout=4)
+    if not info.get('serialNumber'):
+        raise ValueError('not a Hikvision device')
+    dvr.serial = info['serialNumber']
+    return dvr
+
+
+def find_device(user, password, serial=None, near=None):
+    devices = sadp(want=serial)
+    if serial:
+        devices = [item for item in devices if item['serial'] == serial]
+    for device in devices:
+        try:
+            return connect(device, user, password)
+        except Exception:
+            continue
+    if near:
+        return discover(user, password, near)
+    return None
+
+
+def port_open(host, port=80, timeout=0.4):
+    sock = socket.socket()
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def discover(user, password, near, port=554, timeout=0.4):
+    base = near.rsplit('.', 1)[0]
+    hosts = ['%s.%d' % (base, n) for n in range(1, 255)]
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        flags = pool.map(lambda host: port_open(host, port, timeout), hosts)
+    candidates = [host for host, live in zip(hosts, flags) if live]
+    for host in candidates:
+        try:
+            dvr = Dvr(host, user, password)
+            serial = dvr.device_info(timeout=4).get('serialNumber')
+            if serial:
+                dvr.serial = serial
+                return dvr
+        except Exception:
+            continue
+    return None
+
+
 def _stamp(value):
     return value.strftime('%Y%m%dT%H%M%SZ')
 
@@ -238,7 +356,20 @@ def _parse_stamp(text):
 
 
 if __name__ == '__main__':
-    dvr = Dvr()
+    import config
+
+    saved = config.load()
+    if saved is None:
+        raise SystemExit('no saved DVR credentials, run the app once first')
+    dvr = Dvr(saved['ip'], saved['user'], saved['password'], saved['port'])
+    try:
+        dvr.device_info(timeout=5)
+    except Exception:
+        dvr = find_device(saved['user'], saved['password'],
+                          saved['serial'] or None, saved['ip'])
+        if dvr is None:
+            raise SystemExit('no DVR answered on this network')
+        print('moved to %s' % dvr.ip)
     info = dvr.device_info()
     print('%s  %s  fw %s' % (info.get('model'), info.get('deviceType'), info.get('firmwareVersion')))
 
