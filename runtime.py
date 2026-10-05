@@ -1,4 +1,3 @@
-import atexit
 import ctypes
 import faulthandler
 import logging
@@ -17,6 +16,8 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
 SOCKET_TIMEOUT_US = 10000000
 PROBE_SIZE = '100000'
 ANALYZE_DURATION = '500000'
+
+DEFAULT_ASPECT = '4:3'
 
 BACKOFF_BASE = 1.0
 BACKOFF_CAP = 30.0
@@ -129,7 +130,6 @@ def claim_job_object():
                     ctypes.get_last_error())
         return False
     _job_handle = job
-    atexit.register(lambda: None)
     log.info('job object active: children die with this process')
     return True
 
@@ -146,6 +146,11 @@ def rtsp_input(url, hardware=False, duration=None):
     if duration:
         args += ['-t', str(int(duration))]
     return args
+
+
+def aspect_args():
+    ratio = config.setting('aspect', DEFAULT_ASPECT)
+    return [] if ratio == 'source' else ['-aspect', str(ratio)]
 
 
 def spawn(args, stdout=None, stdin=None):

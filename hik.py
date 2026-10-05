@@ -144,8 +144,9 @@ class Dvr:
         cmd = (['ffmpeg', '-y']
                + runtime.rtsp_input(self.playback_url(channel, start, end),
                                     duration=seconds)
-               + ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k', '-aspect', '4:3',
-                  '-movflags', '+frag_keyframe+empty_moov', out_path])
+               + ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k']
+               + runtime.aspect_args()
+               + ['-movflags', '+frag_keyframe+empty_moov', out_path])
         subprocess.run(cmd, check=True, creationflags=runtime.NO_WINDOW)
         return out_path
 

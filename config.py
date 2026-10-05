@@ -131,6 +131,12 @@ def save(ip, user, password, channels=None, serial=None, port=80):
     return _write(payload)
 
 
+def setting(name, default=None):
+    data = _read() or {}
+    value = data.get(name)
+    return default if value in (None, '') else value
+
+
 def remember_channels(channels):
     data = _read()
     if data is None or data.get('channels') == list(channels):
