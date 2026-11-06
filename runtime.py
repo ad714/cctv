@@ -159,7 +159,7 @@ def spawn(args, stdout=None, stdin=None):
         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
 
 
-def stop_process(proc, graceful=False, timeout=5):
+def stop_process(proc, graceful=False, timeout=5, wait=True):
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -172,9 +172,101 @@ def stop_process(proc, graceful=False, timeout=5):
             except Exception:
                 pass
         proc.kill()
-        proc.wait(timeout=timeout)
+        if wait:
+            proc.wait(timeout=timeout)
     except Exception as exc:
         log.debug('stop_process: %s', exc)
+
+
+def pid_file():
+    return config.data_path('instance.pid')
+
+
+def write_pid_file():
+    try:
+        with open(pid_file(), 'w', encoding='utf-8') as handle:
+            handle.write('%d\n%s' % (os.getpid(), sys.executable))
+    except Exception as exc:
+        log.debug('write pid file: %s', exc)
+
+
+def remove_pid_file():
+    try:
+        os.remove(pid_file())
+    except OSError:
+        pass
+
+
+def _read_pid():
+    try:
+        with open(pid_file(), 'r', encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+        return int(lines[0]), (lines[1] if len(lines) > 1 else '')
+    except Exception:
+        return None
+
+
+def _image_name(kernel32, handle):
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
+    size = ctypes.c_uint32(32768)
+    buf = ctypes.create_unicode_buffer(size.value)
+    if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+        return buf.value
+    return ''
+
+
+def kill_stale_instance(timeout=4.0):
+    if not WINDOWS:
+        return False
+    info = _read_pid()
+    if info is None:
+        return False
+    pid, exe = info
+    if pid <= 0 or pid == os.getpid():
+        return False
+    PROCESS_TERMINATE = 0x0001
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    handle = kernel32.OpenProcess(
+        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    if not handle:
+        return False
+    handle = ctypes.c_void_p(handle)
+    try:
+        name = os.path.basename(_image_name(kernel32, handle)).lower()
+        want = os.path.basename(exe).lower()
+        if want and name and name != want:
+            log.warning('pid %d is %s, not %s - not killing', pid, name, want)
+            return False
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.TerminateProcess(handle, 1)
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        log.warning('terminated unresponsive instance pid %d', pid)
+        return True
+    finally:
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle(handle)
+
+
+def arm_hang_dump(timeout=30):
+    if _crash_file is not None:
+        try:
+            faulthandler.dump_traceback_later(
+                timeout, repeat=False, file=_crash_file, exit=False)
+        except Exception as exc:
+            log.debug('arm_hang_dump: %s', exc)
+
+
+def cancel_hang_dump():
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
 
 
 def process_rss_mb():
