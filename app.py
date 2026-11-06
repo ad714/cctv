@@ -7,10 +7,11 @@ from datetime import datetime, timedelta
 
 BOOT = time.monotonic()
 
-from PySide6.QtCore import QDate, QPoint, QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (QDate, QPoint, QPointF, QRect, QRectF, QSize, Qt,
+                            QThread, QTimer, Signal)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPixmap,
-                           QPolygon, QTextCharFormat)
+from PySide6.QtGui import (QAction, QColor, QIcon, QImage, QPainter, QPen,
+                           QPixmap, QPolygon, QPolygonF, QTextCharFormat)
 from PySide6.QtWidgets import (QApplication, QComboBox, QDateEdit, QGridLayout,
                                QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSizePolicy, QStatusBar, QSystemTrayIcon,
@@ -48,6 +49,7 @@ TILE_SIZE = (480, 360)
 FOCUS_SIZE = (1024, 768)
 PREROLL = 3
 STALL_SECONDS = 20
+HANG_SECONDS = 30
 HARDWARE_DECODE = sys.platform == 'win32'
 CAPTURES = config.captures_dir()
 
@@ -57,6 +59,35 @@ QPushButton { background:#1b1b22; color:#9a9aa8; border:1px solid #2c2c36;
 QPushButton:hover { background:#24242e; color:#d0d0dc; }
 QPushButton:checked { background:#2b4a34; color:#7fe0a0; border-color:#3d6b4a; }
 """
+
+OVERLAY_STYLE = """
+QPushButton { background:rgba(10,10,14,140);
+              border:1px solid rgba(255,255,255,45); border-radius:22px; }
+QPushButton:hover { background:rgba(32,32,44,210);
+                    border-color:rgba(255,255,255,130); }
+"""
+
+NAV_PATHS = {
+    'back': [[(19, 12), (5, 12)], [(12, 5), (5, 12), (12, 19)]],
+    'prev': [[(15, 6), (9, 12), (15, 18)]],
+    'next': [[(9, 6), (15, 12), (9, 18)]],
+}
+
+
+def nav_icon(kind, px=48, stroke=2.4, color='#ececf4'):
+    scale = px / 24.0
+    pixmap = QPixmap(px, px)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color), stroke * scale)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    for poly in NAV_PATHS[kind]:
+        painter.drawPolyline(QPolygonF([QPointF(x * scale, y * scale) for x, y in poly]))
+    painter.end()
+    return QIcon(pixmap)
 
 
 class StreamWorker(QThread):
@@ -122,7 +153,7 @@ class StreamWorker(QThread):
 
     def stop(self):
         self.running = False
-        self._kill()
+        runtime.stop_process(self.proc, wait=False)
 
     def _kill(self):
         runtime.stop_process(self.proc)
@@ -177,10 +208,27 @@ class VideoLabel(QLabel):
         self.setStyleSheet('background:#101014; color:#6f6f80; border:1px solid #26262e;')
         self.setText('%s\nconnecting' % title)
         self.frame = None
+        self.zoom = 1.0
+        self.zoom_cx = 0.5
+        self.zoom_cy = 0.5
 
     def set_frame(self, image):
         self.frame = image
         self.update()
+
+    def reset_zoom(self):
+        if self.zoom != 1.0:
+            self.zoom = 1.0
+            self.zoom_cx = 0.5
+            self.zoom_cy = 0.5
+            self.update()
+
+    def _source_rect(self):
+        w = self.frame.width() / self.zoom
+        h = self.frame.height() / self.zoom
+        x = min(max(self.zoom_cx * self.frame.width() - w / 2, 0), self.frame.width() - w)
+        y = min(max(self.zoom_cy * self.frame.height() - h / 2, 0), self.frame.height() - h)
+        return QRectF(x, y, w, h)
 
     def paintEvent(self, event):
         if self.frame is None:
@@ -189,15 +237,34 @@ class VideoLabel(QLabel):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor('#101014'))
         area = self.rect().adjusted(1, 1, -1, -1)
-        size = self.frame.size().scaled(area.size(), Qt.KeepAspectRatio)
+        source = self._source_rect()
+        size = source.size().toSize().scaled(area.size(), Qt.KeepAspectRatio)
         painter.setRenderHint(QPainter.SmoothPixmapTransform,
-                              size.width() * 1.15 < self.frame.width())
-        painter.drawImage(QRect(area.x() + (area.width() - size.width()) // 2,
-                                area.y() + (area.height() - size.height()) // 2,
-                                size.width(), size.height()), self.frame)
+                              size.width() * 1.15 < source.width())
+        target = QRectF(area.x() + (area.width() - size.width()) / 2,
+                        area.y() + (area.height() - size.height()) / 2,
+                        size.width(), size.height())
+        painter.drawImage(target, self.frame, source)
 
     def mousePressEvent(self, event):
         self.clicked.emit()
+
+    def mouseDoubleClickEvent(self, event):
+        if self.frame is None:
+            return
+        if self.zoom > 1.0:
+            self.reset_zoom()
+            return
+        area = self.rect().adjusted(1, 1, -1, -1)
+        size = self.frame.size().scaled(area.size(), Qt.KeepAspectRatio)
+        if size.width() > 0 and size.height() > 0:
+            tx = area.x() + (area.width() - size.width()) / 2
+            ty = area.y() + (area.height() - size.height()) / 2
+            pos = event.position()
+            self.zoom_cx = min(max((pos.x() - tx) / size.width(), 0.0), 1.0)
+            self.zoom_cy = min(max((pos.y() - ty) / size.height(), 0.0), 1.0)
+        self.zoom = 2.0
+        self.update()
 
 
 class Tile(QWidget):
@@ -292,12 +359,19 @@ class LiveView(QWidget):
         self.tiles = {}
         for index, channel in enumerate(channels):
             tile = Tile(index, channel)
-            tile.focus_requested.connect(self.toggle_focus)
+            tile.focus_requested.connect(self.enter_focus)
             tile.audio_requested.connect(self.toggle_audio)
             tile.snap_requested.connect(self.take_snapshot)
             tile.record_requested.connect(self.toggle_record)
             self.tiles[index] = tile
             self.grid.addWidget(tile, index // self.columns, index % self.columns)
+
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.back_btn = self._overlay_button('back', self.exit_focus)
+        self.prev_btn = self._overlay_button('prev', lambda: self.focus_step(-1))
+        self.next_btn = self._overlay_button('next', lambda: self.focus_step(1))
+        for button in (self.back_btn, self.prev_btn, self.next_btn):
+            button.hide()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -350,17 +424,11 @@ class LiveView(QWidget):
         for index in range(self.rows):
             self.grid.setRowStretch(index, 1 if row is None or index == row else 0)
 
-    def toggle_focus(self, slot):
-        if self.focused == slot:
-            self.focused = None
-            self.apply_stretch()
-            for tile in self.tiles.values():
-                tile.setVisible(True)
-            for index, channel in enumerate(self.channels):
-                if index != slot:
-                    self.start_worker(index, self.dvr.live_url(channel, sub=True), TILE_SIZE)
-            self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=True), TILE_SIZE)
-            return
+    def enter_focus(self, slot):
+        if self.focused is None:
+            self.set_focus(slot)
+
+    def set_focus(self, slot):
         self.focused = slot
         self.apply_stretch()
         self.retire_slots({i for i in self.tiles if i != slot})
@@ -368,8 +436,78 @@ class LiveView(QWidget):
             tile.setVisible(index == slot)
             if index != slot:
                 tile.has_frame = False
+        self.tiles[slot].video.reset_zoom()
         self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=False),
                           FOCUS_SIZE, hardware=HARDWARE_DECODE)
+        self.show_overlays(True)
+        self.setFocus()
+
+    def exit_focus(self):
+        slot = self.focused
+        if slot is None:
+            return
+        self.focused = None
+        self.show_overlays(False)
+        self.tiles[slot].video.reset_zoom()
+        self.apply_stretch()
+        for tile in self.tiles.values():
+            tile.setVisible(True)
+        for index, channel in enumerate(self.channels):
+            if index != slot:
+                self.start_worker(index, self.dvr.live_url(channel, sub=True), TILE_SIZE)
+        self.start_worker(slot, self.dvr.live_url(self.channels[slot], sub=True), TILE_SIZE)
+
+    def focus_step(self, delta):
+        if self.focused is None or len(self.channels) < 2:
+            return
+        new = (self.focused + delta) % len(self.channels)
+        if new == self.focused:
+            return
+        old = self.focused
+        self.focused = new
+        self.apply_stretch()
+        self.tiles[old].video.reset_zoom()
+        self.tiles[new].video.reset_zoom()
+        self.tiles[old].setVisible(False)
+        self.tiles[new].setVisible(True)
+        self.tiles[new].has_frame = False
+        self.retire_slots({old})
+        self.start_worker(new, self.dvr.live_url(self.channels[new], sub=False),
+                          FOCUS_SIZE, hardware=HARDWARE_DECODE)
+        self.position_overlays()
+
+    def _overlay_button(self, kind, handler):
+        button = QPushButton('', self)
+        button.setIcon(nav_icon(kind))
+        button.setIconSize(QSize(26, 26))
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setStyleSheet(OVERLAY_STYLE)
+        button.clicked.connect(handler)
+        return button
+
+    def show_overlays(self, visible):
+        multi = len(self.channels) > 1
+        self.back_btn.setVisible(visible)
+        self.prev_btn.setVisible(visible and multi)
+        self.next_btn.setVisible(visible and multi)
+        if visible:
+            self.position_overlays()
+
+    def position_overlays(self):
+        size = 44
+        margin = 14
+        middle = (self.height() - size) // 2
+        self.back_btn.setGeometry(margin, margin, size, size)
+        self.prev_btn.setGeometry(margin, middle, size, size)
+        self.next_btn.setGeometry(self.width() - size - margin, middle, size, size)
+        for button in (self.back_btn, self.prev_btn, self.next_btn):
+            button.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.focused is not None:
+            self.position_overlays()
 
     def toggle_audio(self, slot):
         if self.audio.slot == slot:
@@ -487,8 +625,18 @@ class LiveView(QWidget):
             mode, '  '.join(parts), len(self.recorders), tail))
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape and self.focused is not None:
-            self.toggle_focus(self.focused)
+        if self.focused is None:
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key == Qt.Key_Escape:
+            self.exit_focus()
+        elif key == Qt.Key_Left:
+            self.focus_step(-1)
+        elif key == Qt.Key_Right:
+            self.focus_step(1)
+        else:
+            super().keyPressEvent(event)
 
     def shutdown(self):
         self.timer.stop()
@@ -946,6 +1094,11 @@ class MainWindow(QMainWindow):
         self.upkeep.start(30 * 60 * 1000)
         QTimer.singleShot(5000, self.housekeeping)
 
+        self.hang = QTimer(self)
+        self.hang.timeout.connect(self.rearm_hang_dump)
+        self.hang.start(5000)
+        runtime.arm_hang_dump(HANG_SECONDS)
+
         self.watcher = EventWatcher(dvr, self.store)
         self.watcher.detected.connect(self.on_detected)
         self.watcher.trouble.connect(self.on_watcher_trouble)
@@ -975,6 +1128,9 @@ class MainWindow(QMainWindow):
         if connection is not None:
             connection.readyRead.connect(connection.deleteLater)
         self.restore_window()
+
+    def rearm_hang_dump(self):
+        runtime.arm_hang_dump(HANG_SECONDS)
 
     def housekeeping(self):
         runtime.log.info('memory %.0f MB, %d detection(s) stored',
@@ -1030,6 +1186,9 @@ class MainWindow(QMainWindow):
                                   QSystemTrayIcon.Information, 4000)
             return
         self.upkeep.stop()
+        self.hang.stop()
+        runtime.cancel_hang_dump()
+        runtime.remove_pid_file()
         self.tray.hide()
         self.ipc.close()
         QLocalServer.removeServer(IPC_NAME)
@@ -1070,10 +1229,13 @@ def main():
     qt.setApplicationName('CCTV')
     qt.setWindowIcon(app_icon())
     if already_running():
-        close_splash()
-        ask_running_instance_to_show()
-        return 0
+        if ask_running_instance_to_show():
+            close_splash()
+            return 0
+        runtime.log.warning('running instance did not respond, taking over')
+        runtime.kill_stale_instance()
     qt.setQuitOnLastWindowClosed(False)
+    runtime.write_pid_file()
     missing = [tool for tool in ('ffmpeg', 'ffplay') if not find_tool(tool)]
     if missing:
         close_splash()
