@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 DAY = 86400.0
@@ -43,16 +43,19 @@ class TimelineBar(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(96)
+        self.setMinimumHeight(104)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
         self.segments = []
         self.markers = []
         self.position = None
         self.selection = None
         self.view_start = 0.0
         self.view_end = DAY
-        self._press_x = None
-        self._dragging = False
+        self._hover_x = None
+        self._scrubbing = False
+        self._selecting = False
+        self._sel_anchor = None
         self._panning = False
         self._pan_origin = None
 
@@ -73,6 +76,8 @@ class TimelineBar(QWidget):
         self.update()
 
     def set_position(self, seconds):
+        if self._scrubbing:
+            return
         self.position = seconds
         self.update()
 
@@ -124,6 +129,19 @@ class TimelineBar(QWidget):
         ratio = (x - track.left()) / max(1.0, track.width())
         return max(0.0, min(DAY, self.view_start + ratio * self.span()))
 
+    def _snap(self, seconds):
+        track = self._track()
+        gap = self.span() / max(1.0, track.width()) * 7
+        best = seconds
+        candidates = [edge for start, end in self.segments for edge in (start, end)]
+        candidates += [start for start, _end in self.markers]
+        for edge in candidates:
+            distance = abs(edge - seconds)
+            if distance < gap:
+                gap = distance
+                best = edge
+        return best
+
     def _tick_step(self):
         track = self._track()
         want = max(4, int(track.width() / 110))
@@ -168,8 +186,13 @@ class TimelineBar(QWidget):
 
         if self.position is not None:
             x = self._to_x(self.position)
-            painter.setPen(QPen(PLAYHEAD, 1))
+            painter.setPen(QPen(PLAYHEAD, 2))
             painter.drawLine(int(x), int(track.top()), int(x), int(track.bottom()))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(PLAYHEAD)
+            painter.drawPolygon(QPolygonF([
+                QPointF(x - 6, track.top() - 1), QPointF(x + 6, track.top() - 1),
+                QPointF(x, track.top() + 8)]))
         painter.setClipping(False)
 
         step = self._tick_step()
@@ -205,6 +228,22 @@ class TimelineBar(QWidget):
         painter.setPen(QPen(SELECTION_EDGE, 1))
         painter.drawRect(window)
 
+        cursor_x = self._hover_x
+        if self._scrubbing and self.position is not None:
+            cursor_x = self._to_x(self.position)
+        if cursor_x is not None and track.left() - 1 <= cursor_x <= track.right() + 1:
+            seconds = self.position if self._scrubbing else self._to_seconds(cursor_x)
+            font.setPointSize(8)
+            painter.setFont(font)
+            width, height = 60.0, 17.0
+            box = QRectF(min(max(cursor_x - width / 2, track.left()), track.right() - width),
+                         track.top() + 2, width, height)
+            painter.setBrush(QColor(12, 12, 16, 235))
+            painter.setPen(QPen(SELECTION_EDGE, 1))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setPen(QPen(PLAYHEAD, 1))
+            painter.drawText(box, Qt.AlignCenter, clock(int(seconds), True))
+
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         if delta == 0:
@@ -225,39 +264,60 @@ class TimelineBar(QWidget):
             return
         if event.button() != Qt.LeftButton:
             return
-        self._press_x = event.position().x()
-        self._dragging = False
+        x = event.position().x()
+        self._hover_x = x
+        if event.modifiers() & Qt.ShiftModifier:
+            self._selecting = True
+            self._sel_anchor = x
+            self.selection = None
+        else:
+            self._scrubbing = True
+            self.position = self._to_seconds(x)
+        self.update()
 
     def mouseMoveEvent(self, event):
+        x = event.position().x()
         if self._panning and self._pan_origin is not None:
             track = self._track()
-            moved = (event.position().x() - self._pan_origin[0]) / max(1.0, track.width())
+            moved = (x - self._pan_origin[0]) / max(1.0, track.width())
             start = self._pan_origin[1] - moved * self.span()
             self.set_view(start, start + self.span())
             return
-        if self._press_x is None:
-            return
-        if abs(event.position().x() - self._press_x) > 3:
-            self._dragging = True
-            a = self._to_seconds(self._press_x)
-            b = self._to_seconds(event.position().x())
+        self._hover_x = x
+        if self._selecting and self._sel_anchor is not None:
+            a = self._to_seconds(self._sel_anchor)
+            b = self._to_seconds(x)
             self.selection = (min(a, b), max(a, b))
             self.selection_changed.emit(self.selection)
-            self.update()
+        elif self._scrubbing:
+            self.position = self._to_seconds(x)
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if self._panning:
             self._panning = False
             self._pan_origin = None
             return
-        if self._press_x is None:
+        if event.button() != Qt.LeftButton:
             return
-        if not self._dragging:
-            self.selection = None
-            self.selection_changed.emit(None)
-            self.seek_requested.emit(self._to_seconds(event.position().x()))
-        self._press_x = None
-        self._dragging = False
+        x = event.position().x()
+        if self._selecting:
+            self._selecting = False
+            self._sel_anchor = None
+            if self.selection is None or self.selection[1] - self.selection[0] < 1:
+                self.selection = None
+                self.selection_changed.emit(None)
+            self.update()
+            return
+        if self._scrubbing:
+            self._scrubbing = False
+            seconds = self._snap(self._to_seconds(x))
+            self.position = seconds
+            self.seek_requested.emit(seconds)
+            self.update()
+
+    def leaveEvent(self, event):
+        self._hover_x = None
         self.update()
 
     def mouseDoubleClickEvent(self, event):
