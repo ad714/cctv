@@ -1,3 +1,4 @@
+import re
 import socket
 import subprocess
 import threading
@@ -122,6 +123,37 @@ class Dvr:
             segments.append((_parse(span.find('h:startTime', NS).text),
                              _parse(span.find('h:endTime', NS).text)))
         return segments
+
+    def playback_segments(self, channel, start, end, max_results=400):
+        body = SEARCH_BODY % (uuid.uuid4(), channel, _iso(start), _iso(end), max_results)
+        root = self.post_xml('/ISAPI/ContentMgmt/search', body)
+        out = []
+        for item in root.iter('{%s}searchMatchItem' % NS['h']):
+            span = item.find('h:timeSpan', NS)
+            uri = item.find('.//h:playbackURI', NS)
+            if span is None or uri is None or not uri.text:
+                continue
+            name = re.search(r'name=([^&]+)', uri.text)
+            out.append((_parse(span.find('h:startTime', NS).text),
+                        _parse(span.find('h:endTime', NS).text),
+                        name.group(1) if name else None))
+        return out
+
+    def earliest_recording(self, channel, lookback_days=3650):
+        start = datetime.now() - timedelta(days=lookback_days)
+        found = self.playback_segments(channel, start, datetime.now(), max_results=1)
+        return found[0][0] if found else None
+
+    def download_stream(self, channel, name, start, end):
+        uri = ('rtsp://%s/Streaming/tracks/%d01/?starttime=%s&endtime=%s&name=%s&size=0'
+               % (self.ip, channel, _stamp(start), _stamp(end), name))
+        body = ('<?xml version="1.0" encoding="utf-8"?>'
+                '<downloadRequest version="1.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
+                '<playbackURI>%s</playbackURI></downloadRequest>' % uri.replace('&', '&amp;'))
+        request = urllib.request.Request(
+            'http://%s/ISAPI/ContentMgmt/download' % self.host,
+            data=body.encode('utf-8'), headers={'Content-Type': 'application/xml'})
+        return self.opener.open(request, timeout=30)
 
     def record_days(self, channel, year, month, sub=False):
         body = DAILY_BODY % (year, month)
