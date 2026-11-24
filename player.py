@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QImage
@@ -11,15 +11,22 @@ from PySide6.QtGui import QImage
 import runtime
 
 SPEEDS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
-CHUNK_BYTES = 96 * 1024 * 1024
-PREBUFFER_BYTES = 1024 * 1024
+CHUNK_BYTES = 400 * 1024 * 1024
+PREBUFFER_BYTES = 96 * 1024
+FOLLOW_TIMEOUT_US = 4000000
+LIVE_EDGE = timedelta(minutes=3)
+LIVE_RETRIES = 20
+LIVE_RETRY_MS = 3000
+FOLLOW_SPAN = timedelta(hours=2)
 DEFAULT_FPS = 15.0
+LOCAL = 'local'
 
 
 def probe_fps(path):
     try:
         out = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            ['ffprobe', '-v', 'error', '-probesize', runtime.PROBE_SIZE,
+             '-analyzeduration', runtime.ANALYZE_DURATION, '-select_streams', 'v:0',
              '-show_entries', 'stream=avg_frame_rate', '-of', 'default=nk=1:nw=1', path],
             capture_output=True, text=True, timeout=8,
             creationflags=runtime.NO_WINDOW).stdout.strip()
@@ -30,12 +37,11 @@ def probe_fps(path):
         return DEFAULT_FPS
 
 
-class Downloader(threading.Thread):
-    def __init__(self, dvr, channel, name, begin, finish, path, cap=CHUNK_BYTES):
+class Recorder(threading.Thread):
+    def __init__(self, dvr, channel, begin, finish, path, cap=CHUNK_BYTES):
         super().__init__(daemon=True)
         self.dvr = dvr
         self.channel = channel
-        self.name = name
         self.begin = begin
         self.finish = finish
         self.path = path
@@ -43,34 +49,36 @@ class Downloader(threading.Thread):
         self.written = 0
         self.finished = False
         self.error = None
+        self.proc = None
         self._stop = False
 
     def run(self):
+        seconds = max(1, int((self.finish - self.begin).total_seconds()))
+        url = self.dvr.playback_url(self.channel, self.begin, self.finish)
+        command = (['ffmpeg', '-y'] + runtime.rtsp_input(url, duration=seconds)
+                   + ['-map', '0:v', '-map', '0:a?', '-c:v', 'copy', '-c:a', 'aac',
+                      '-b:a', '64k', '-flush_packets', '1', '-f', 'mpegts', self.path])
         try:
-            resp = self.dvr.download_stream(self.channel, self.name, self.begin, self.finish)
-        except Exception as exc:
-            self.error = exc
-            self.finished = True
-            return
-        try:
-            with open(self.path, 'wb', buffering=0) as handle:
-                while not self._stop and self.written < self.cap:
-                    chunk = resp.read(262144)
-                    if not chunk:
+            self.proc = runtime.spawn(command, stdout=subprocess.DEVNULL)
+            while not self._stop and self.proc.poll() is None:
+                if os.path.exists(self.path):
+                    self.written = os.path.getsize(self.path)
+                    if self.written >= self.cap:
                         break
-                    handle.write(chunk)
-                    self.written += len(chunk)
+                time.sleep(0.05)
+            runtime.stop_process(self.proc, wait=False)
+            if os.path.exists(self.path):
+                self.written = os.path.getsize(self.path)
+            if self.written == 0 and not self._stop:
+                self.error = RuntimeError('no footage at that time')
         except Exception as exc:
             self.error = exc
         finally:
-            try:
-                resp.close()
-            except Exception:
-                pass
             self.finished = True
 
     def stop(self):
         self._stop = True
+        runtime.stop_process(self.proc, wait=False)
 
 
 class Decoder(QThread):
@@ -78,8 +86,9 @@ class Decoder(QThread):
     advanced = Signal(float)
     ended = Signal(float)
 
-    def __init__(self, path, offset, size, fps):
+    def __init__(self, path, offset, size, fps, denoise=0):
         super().__init__()
+        self.denoise = denoise
         self.path = path
         self.offset = offset
         self.width, self.height = size
@@ -92,8 +101,11 @@ class Decoder(QThread):
 
     def _command(self):
         return (['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                 '-follow', '1', '-rw_timeout', str(FOLLOW_TIMEOUT_US),
+                 '-probesize', runtime.PROBE_SIZE, '-analyzeduration', runtime.ANALYZE_DURATION,
                  '-ss', '%.3f' % max(0.0, self.offset), '-i', self.path, '-an',
-                 '-vf', 'scale=%d:%d,setsar=1' % (self.width, self.height),
+                 '-vf', '%sscale=%d:%d,setsar=1' % (runtime.denoise_filter(self.denoise),
+                                                    self.width, self.height),
                  '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'])
 
     def _frames_per_tick(self):
@@ -169,6 +181,9 @@ class Playback(QObject):
         self.segments = []
         self.speed = 1.0
         self.paused = False
+        self.denoise = 0
+        self.fetch_limit = None
+        self._fps_by_channel = {}
         self._dir = tempfile.mkdtemp(prefix='cctv-pb-')
         self._path = None
         self._file_start = None
@@ -178,6 +193,7 @@ class Playback(QObject):
         self._decoder = None
         self._position_dt = None
         self._pending_step = False
+        self._retries = 0
         self._prebuffer = QTimer(self)
         self._prebuffer.setInterval(60)
         self._prebuffer.timeout.connect(self._check_prebuffer)
@@ -203,16 +219,47 @@ class Playback(QObject):
         for start, end, name in self.segments:
             if start <= moment <= end and name:
                 return (start, end, name)
+        last = self.segments[-1] if self.segments else None
+        if last is not None and self._is_open(last) and last[0] <= moment < datetime.now():
+            return self.segments[-1]
         return None
 
+    @staticmethod
+    def _is_open(segment):
+        return segment[2] != LOCAL and segment[1] > datetime.now() - LIVE_EDGE
+
+    def play_file(self, path, channel, start, end, moment):
+        self.stop()
+        self.channel = channel
+        self.day = start.date()
+        self.segments = [(start, end, LOCAL)]
+        self._path = path
+        self._file_start = start
+        self._segment = self.segments[0]
+        self._position_dt = moment
+        self._fps = self._probe(path)
+        self._start_decoder(max(0.0, (moment - start).total_seconds()))
+
+    def release(self):
+        self._teardown_decoder()
+        self._teardown_downloader()
+
+    def _probe(self, path):
+        if self.channel not in self._fps_by_channel:
+            self._fps_by_channel[self.channel] = probe_fps(path)
+        return self._fps_by_channel[self.channel]
+
     def play_at(self, moment, keep_paused=False):
+        self._retries = 0
         segment = self._segment_for(moment)
         if segment is None:
             self.state.emit('no footage at that time')
             return False
+        cached_until = segment[1] if segment[2] == LOCAL else (
+            self._position_dt or self._file_start)
         reuse = (self._path and self._file_start and self._segment
                  and self._segment[2] == segment[2]
-                 and self._file_start <= moment <= (self._position_dt or self._file_start))
+                 and self._file_start <= moment <= cached_until)
         self._position_dt = moment
         self.paused = keep_paused
         if reuse:
@@ -224,11 +271,17 @@ class Playback(QObject):
     def _new_download(self, segment, moment):
         self._teardown_decoder()
         self._teardown_downloader()
-        self._path = os.path.join(self._dir, 'win-%d.mpg' % int(time.time() * 1000))
+        self._discard_cache()
+        self._path = os.path.join(self._dir, 'win-%d.ts' % int(time.time() * 1000))
         self._file_start = moment
         self._segment = segment
-        self._downloader = Downloader(self.dvr, self.channel, segment[2], moment, segment[1],
-                                      self._path)
+        if self._is_open(segment):
+            finish = moment + FOLLOW_SPAN
+        else:
+            finish = max(segment[1], moment + timedelta(seconds=30))
+        if self.fetch_limit is not None:
+            finish = max(moment + timedelta(seconds=5), min(finish, self.fetch_limit))
+        self._downloader = Recorder(self.dvr, self.channel, moment, finish, self._path)
         self._downloader.start()
         self.state.emit('buffering')
         self._prebuffer.start()
@@ -240,6 +293,14 @@ class Playback(QObject):
             return
         if downloader.error is not None:
             self._prebuffer.stop()
+            segment, moment = self._segment, self._file_start
+            near_live = (segment is not None and moment is not None and self._is_open(segment)
+                         and moment > datetime.now() - LIVE_EDGE)
+            if near_live and self._retries < LIVE_RETRIES:
+                self._retries += 1
+                self.state.emit('waiting')
+                QTimer.singleShot(LIVE_RETRY_MS, lambda: self._retry(downloader, segment, moment))
+                return
             self.state.emit('could not load footage')
             return
         if downloader.written >= PREBUFFER_BYTES or downloader.finished:
@@ -247,12 +308,17 @@ class Playback(QObject):
             if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
                 self.state.emit('no footage at that time')
                 return
-            self._fps = probe_fps(self._path)
+            self._retries = 0
+            self._fps = self._probe(self._path)
             self._start_decoder(0.0)
+
+    def _retry(self, failed, segment, moment):
+        if self._downloader is failed:
+            self._new_download(segment, moment)
 
     def _start_decoder(self, offset):
         self._teardown_decoder()
-        decoder = Decoder(self._path, offset, self.size, self._fps)
+        decoder = Decoder(self._path, offset, self.size, self._fps, self.denoise)
         decoder.set_speed(self.speed)
         if self.paused:
             decoder.pause()
@@ -283,7 +349,13 @@ class Playback(QObject):
             return
         reached = self._file_start + timedelta(seconds=final_seconds)
         segment = self._segment
-        if segment is not None and reached < segment[1] - timedelta(seconds=1) \
+        if segment is not None and self._is_open(segment):
+            limit = datetime.now() + LIVE_EDGE
+        else:
+            limit = segment[1] if segment is not None else reached
+        if self.fetch_limit is not None:
+            limit = min(limit, self.fetch_limit)
+        if segment is not None and reached < limit - timedelta(seconds=1) \
                 and reached > self._file_start + timedelta(seconds=1):
             self._decoder = None
             self._new_download(segment, reached)
@@ -312,6 +384,11 @@ class Playback(QObject):
         if self._decoder is not None:
             self._decoder.set_speed(speed)
 
+    def set_denoise(self, level):
+        self.denoise = level
+        if self._decoder is not None and self._position_dt is not None:
+            self.play_at(self._position_dt, keep_paused=self.paused)
+
     def step(self):
         if self._decoder is None:
             return
@@ -337,6 +414,14 @@ class Playback(QObject):
             self._decoder.wait(2000)
             self._decoder = None
 
+    def _discard_cache(self):
+        os.makedirs(self._dir, exist_ok=True)
+        for name in os.listdir(self._dir):
+            try:
+                os.remove(os.path.join(self._dir, name))
+            except OSError:
+                pass
+
     def _teardown_downloader(self):
         self._prebuffer.stop()
         if self._downloader is not None:
@@ -350,15 +435,3 @@ class Playback(QObject):
         self._segment = None
         self._position_dt = None
         self.paused = False
-
-    def shutdown(self):
-        self.stop()
-        try:
-            for name in os.listdir(self._dir):
-                try:
-                    os.remove(os.path.join(self._dir, name))
-                except OSError:
-                    pass
-            os.rmdir(self._dir)
-        except OSError:
-            pass

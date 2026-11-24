@@ -2,6 +2,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from datetime import timedelta
 
 from PySide6.QtCore import QThread, Signal
@@ -21,19 +23,22 @@ def _segment_for(dvr, channel, moment):
 
 
 def fast_clip(dvr, channel, seg_start, begin, end, out_path, with_audio,
-              aspect_args, cancel):
+              aspect_args, cancel, on_seconds=None):
     duration = int((end - begin).total_seconds())
     if duration <= 0:
         raise ValueError('end must be after start')
     pre = min(3.0, max(0.0, (begin - seg_start).total_seconds()))
     url = dvr.playback_url(channel, begin - timedelta(seconds=pre), end)
     audio = ['-c:a', 'aac', '-b:a', '64k'] if with_audio else ['-an']
-    cmd = (['ffmpeg', '-y'] + runtime.rtsp_input(url)
+    cmd = (['ffmpeg', '-y', '-nostats', '-progress', 'pipe:1'] + runtime.rtsp_input(url)
            + ['-ss', '%.3f' % pre, '-t', str(duration),
               '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21']
            + audio + aspect_args + ['-movflags', '+faststart', out_path])
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             creationflags=runtime.NO_WINDOW)
+    watcher = threading.Thread(target=_read_progress, args=(proc.stdout, on_seconds),
+                               daemon=True)
+    watcher.start()
     while True:
         try:
             proc.wait(timeout=0.25)
@@ -45,6 +50,16 @@ def fast_clip(dvr, channel, seg_start, begin, end, out_path, with_audio,
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise RuntimeError('no footage in that range for camera %d' % channel)
     return out_path
+
+
+def _read_progress(stream, on_seconds):
+    for line in stream:
+        if on_seconds is None or not line.startswith(b'out_time_us='):
+            continue
+        try:
+            on_seconds(max(0.0, int(line.split(b'=', 1)[1]) / 1e6))
+        except ValueError:
+            pass
 
 
 def _layout(count):
@@ -114,6 +129,7 @@ def build_mosaic(clips, audio_indices, out_path, cancel):
 
 class ExportJob(QThread):
     progress = Signal(str)
+    fraction = Signal(float, float)
     done = Signal(bool, str)
 
     def __init__(self, dvr, cameras, begin, finish, mode, audio_cameras, out_dir, aspect_args):
@@ -137,6 +153,16 @@ class ExportJob(QThread):
     def run(self):
         tmp = tempfile.mkdtemp(prefix='cctv-exp-')
         made = []
+        span = max(1.0, (self.finish - self.begin).total_seconds())
+        total = span * len(self.cameras)
+        started = time.monotonic()
+
+        def report(done):
+            share = min(1.0, done / total)
+            spent = time.monotonic() - started
+            remaining = spent / share - spent if share > 0.02 else -1.0
+            self.fraction.emit(share, remaining)
+
         try:
             clips = []
             for index, channel in enumerate(self.cameras):
@@ -151,16 +177,17 @@ class ExportJob(QThread):
                 tmp_clip = os.path.join(tmp, 'ch%d.mp4' % channel)
                 with_audio = channel in self.audio_cameras
                 fast_clip(self.dvr, channel, seg_start, self.begin, self.finish,
-                          tmp_clip, with_audio, self.aspect_args, self._cancelled)
+                          tmp_clip, with_audio, self.aspect_args, self._cancelled,
+                          lambda seconds, base=index * span: report(base + min(seconds, span)))
                 clips.append((channel, tmp_clip, with_audio))
 
             stamp = self.begin.strftime('%Y%m%d-%H%M%S')
-            span = self.finish.strftime('%H%M%S')
+            until = self.finish.strftime('%H%M%S')
 
             if self.mode in ('separate', 'both'):
                 for channel, tmp_clip, _audio in clips:
                     final = os.path.join(self.out_dir, 'clip-ch%d-%s-%s.mp4'
-                                         % (channel, stamp, span))
+                                         % (channel, stamp, until))
                     shutil.copyfile(tmp_clip, final)
                     made.append(final)
 
@@ -170,7 +197,7 @@ class ExportJob(QThread):
                              if ch in self.audio_cameras]
                 channels = '-'.join(str(ch) for ch, _p, _a in clips)
                 final = os.path.join(self.out_dir, 'mosaic-ch%s-%s-%s.mp4'
-                                     % (channels, stamp, span))
+                                     % (channels, stamp, until))
                 build_mosaic([p for _c, p, _a in clips], audio_idx, final, self._cancelled)
                 made.append(final)
 

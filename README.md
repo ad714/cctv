@@ -14,24 +14,50 @@ work, but only this model has actually been verified.
 
 ## What it does
 
+**Recent tab** (opens first)
+- Every person and vehicle event, newest first, with the DVR's snapshot taken the moment
+  it happened, the camera, the time and how long ago
+- Selecting an event replays it straight away, from a few seconds before to a few after
+- Filters: today, yesterday or 7 days, camera, people or vehicles, unread only
+- Save the event as a clip, open it in Playback, or jump to that camera live
+- "All cameras, last 2 / 5 / 15 min" replays every camera together from that point
+
 **Live tab**
-- All cameras in a grid, click any tile to expand it to full resolution
-- Per-camera audio (one at a time), snapshot, and record-to-file
-- Sub-streams in the grid, main stream when expanded, so six cameras cost very little
-- Expanded and playback streams use **D3D11VA hardware decode** (about 40% less CPU),
-  falling back to software automatically if the GPU or driver cannot do it
+- All cameras in a grid, click any tile to expand it
+- Expanded camera: HD or SD stream, noise reduction, and that camera's last 24 hours of
+  events beside the video
+- Per-camera sound, snapshot and record-to-file; tiles show how many events are unread
+- Streams only run while the tab is on screen, so the app costs nothing in the tray
 
 **Playback tab**
-- Calendar showing which days have footage
-- Timeline of the day: green where footage exists, orange where motion was detected
-- Zoom from the full 24 hours down to a 30-second window
-- `<< Motion` / `Motion >>` jump straight between motion events and skip the empty hours
-- Drag a range on the timeline and export it as an MP4
-- Playback audio
+- Calendar showing which days have footage, a timeline with a person or vehicle mark at
+  each event and the event's snapshot on hover
+- Zoom from the full day to 30 seconds, type a time to jump to it, step frames,
+  jump between events, and list the day's events beside the video
+- Shift+drag selects a range, drag its edges to adjust, then export with a progress bar
+  and time left; separate clips or one mosaic of several cameras
+- Sound up to 4x speed, noise reduction, all cameras synced in one grid
+- Lanes: one row per camera under the timeline showing its events; click one to jump there
+- Bookmarks (B): a flag on the timeline, right-click it to add a note or delete it
+- Loop: repeats the selected range for close review
+
+**Album tab**
+- Snapshots, recordings and saved clips with thumbnails, newest first; open, show in
+  folder, or move to the Recycle Bin
+
+**Device tab**
+- DVR model, serial, firmware, uptime, restart
+- Disk health, capacity, and how many days of footage the disk holds
+- Desktop alerts: on or off, people or vehicles, which cameras, quiet hours
+- Viewing defaults: noise reduction level, expanded camera quality
 
 **Motion index**
-- The DVR classifies motion as `human` or `vehicle` on-device; this app just records it
-- Bursts are coalesced into episodes, so one person walking past is one marker, not fifty
+- The DVR classifies motion as `human` or `vehicle` on-device; this app records it, grabs
+  one snapshot per event and remembers which events you have seen
+- About 45 seconds after each event (once the DVR has saved it) a short clip of it is
+  cached locally, so replays start in a fraction of a second and Save clip is quick.
+  Clips are kept 2 days; events from the last 7 days without a snapshot get one too
+- Bursts are coalesced into episodes, so one person walking past is one event, not fifty
 - Stored in SQLite, no video decoding and no inference, so it costs almost nothing
 
 ---
@@ -81,12 +107,14 @@ python -m venv .venv
 .venv\Scripts\python.exe build.py
 ```
 
-Output lands in `dist\CCTV\CCTV.exe` (about 73 MB, folder is self-contained apart from
+Output lands in `dist\CCTV\CCTV.exe` (about 69 MB, folder is self-contained apart from
 FFmpeg). The build prunes Qt payload the app never uses: the software OpenGL fallback,
 Qt's translations, and Qt's own OpenSSL.
 
-The splash screen shown while the app loads is `splash.png`, regenerated with
-`python tools\make_splash.py`.
+There is no splash screen: the window itself appears in well under a second, with the
+Recent tab filled from the local event index before any network call finishes.
+
+`python tools\selfcheck.py` runs the quick logic checks (event store, alert rules).
 
 ---
 
@@ -117,9 +145,6 @@ The password is encrypted with **Windows DPAPI**, tied to your Windows user acco
 another account on the same machine cannot read it. To forget the saved login, delete
 that file.
 
-If a legacy `.hikenv` file is present next to the app on first run, it is imported once
-and then the encrypted config is used.
-
 ---
 
 ## Where things are saved
@@ -128,6 +153,8 @@ and then the encrypted config is used.
 |---|---|
 | Credentials | `%LOCALAPPDATA%\HikViewer\config.json` |
 | Motion index | `%LOCALAPPDATA%\HikViewer\events.db` (pruned past 180 days) |
+| Event snapshots | `%LOCALAPPDATA%\HikViewer\thumbs` (pruned with their events) |
+| Event clips | `%LOCALAPPDATA%\HikViewer\clips` (kept 2 days) |
 | Logs | `%LOCALAPPDATA%\HikViewer\cctv.log`, `crash.log` |
 | Snapshots, recordings, exported clips | `%USERPROFILE%\Videos\CCTV` |
 
@@ -143,13 +170,17 @@ destroys your history or your clips.
 ## Behaviour worth knowing
 
 **Closing the window does not quit.** It hides to the system tray and keeps recording
-motion. Quit from the tray icon's menu.
+events, with live streams stopped. Quit from the tray icon's menu; quitting is instant.
 
-**Only one instance runs.** Launching it again raises the existing window.
+**Only one instance runs.** Launching it again hands over to the running copy before Qt
+even loads, and that copy comes to the front on the Recent tab.
 
-**Playback runs at 1x.** The DVR streams recorded footage at real time and offers no
-faster transfer, so exporting a 10-minute clip takes 10 minutes. Export runs in the
-background and the window stays usable. This is a limitation of the DVR, not the client.
+**Footage arrives at real time.** The only time-accurate way to read recordings is the
+DVR's RTSP playback track, which it sends at 1x. Playback, event replay and export all
+use it: a jump lands on the right second within about two seconds, speeds above 1x run
+fast through footage already fetched and then follow at real time, and exporting a
+10-minute clip takes about 10 minutes (with a progress bar and time left). The last
+20-30 seconds before now are not saved by the DVR yet; playback waits for them.
 
 **The motion index only fills while the app is running.** The DVR does not keep a
 searchable motion log, and `ContentMgmt/SmartSearch` is unsupported on this model
@@ -179,6 +210,11 @@ to lose and hard to rediscover:
 - Motion detection already ships with `targetType: human,vehicle` enabled, but the VMD
   trigger has no `center` notification by default, so events never reach the alert
   stream until you add one
+- `ContentMgmt/download` with a segment `name` **ignores `starttime`** and always sends
+  the segment from its beginning (verified: identical bytes for two start times, open and
+  closed segments). It is fast (about 8.6 MB/s) but cannot seek, so it is not used
+- Desktop alert snapshots come from `Streaming/channels/<ch>01/picture`, taken the moment
+  the alert arrives; the DVR keeps no picture of its own for this event type
 - `urllib`'s digest auth handler keeps per-request state and is **not thread safe**.
   Sharing one opener across the parallel camera probe silently dropped cameras from the
   results; each thread needs its own opener
@@ -188,25 +224,29 @@ to lose and hard to rediscover:
 ## Layout
 
 ```
-app.py        UI, live grid, playback, tray, entry point
-hik.py        ISAPI and RTSP client (device info, search, playback, clips, events)
-timeline.py   Zoomable timeline widget
-events.py     Motion episode store and DVR alert-stream watcher
+app.py        Main window, tray, single instance, startup
+recent.py     Recent tab and the event list used by Live and Playback
+live.py       Live tab: camera grid, expanded camera, recording
+playback.py   Playback tab and the export dialog
+panels.py     Album and Device tabs, desktop alert rules
+widgets.py    Video surface, flow layout, background calls, audio player
+theme.py      Colour and type tokens, stylesheet, person and vehicle marks
+player.py     Time-accurate playback engine (RTSP cache plus frame decoder)
+export.py     Clip and mosaic export with progress
+hik.py        ISAPI and RTSP client (device info, storage, search, playback, events)
+timeline.py   Zoomable timeline widget with event marks and hover snapshots
+events.py     Event store, alert-stream watcher, snapshots, event clip cache
 login.py      Connection dialog
 config.py     Encrypted credential and path handling
 build.py      PyInstaller build
-detect.py     Optional YOLO pass over an exported clip (not used by the app)
 ```
-
-`detect.py` is kept separate: the DVR already classifies human vs vehicle, so YOLO is not
-needed for normal use. It is there for finer labels on an exported clip if you want them.
 
 ---
 
 ## Status
 
 v1. Working and in daily use, but young. PTZ is absent because the cameras are fixed
-analog. Multi-DVR, remote access and notifications are not implemented.
+analog. Multi-DVR and remote access are not implemented; alerts are desktop notifications only.
 
 ## Licence
 
