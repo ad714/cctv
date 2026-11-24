@@ -51,6 +51,13 @@ def setup_logging(level=logging.INFO):
     return log
 
 
+def shutdown_logging():
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+
+
 def _on_exception(kind, value, trace):
     log.critical('unhandled exception', exc_info=(kind, value, trace))
 
@@ -146,6 +153,32 @@ def rtsp_input(url, hardware=False, duration=None):
     if duration:
         args += ['-t', str(int(duration))]
     return args
+
+
+def denoise_level(enabled=True):
+    level = int(config.setting('denoise', 0) or 0)
+    if not enabled:
+        return 0
+    return level or 3
+
+
+def denoise_filter(level):
+    if not level:
+        return ''
+    level = max(1, min(5, int(level)))
+    return 'hqdn3d=%.1f:%.1f:%.1f:%.1f,' % (1.5 * level, 1.2 * level, 3.0 * level, 2.5 * level)
+
+
+def atempo_chain(speed):
+    parts = []
+    while speed > 2.0:
+        parts.append('atempo=2.0')
+        speed /= 2.0
+    while speed < 0.5:
+        parts.append('atempo=0.5')
+        speed /= 0.5
+    parts.append('atempo=%.4f' % speed)
+    return ','.join(parts)
 
 
 def aspect_args():

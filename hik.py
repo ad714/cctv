@@ -1,6 +1,5 @@
 import re
 import socket
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +11,7 @@ import urllib.error
 import urllib.request
 
 NS = {'h': 'http://www.hikvision.com/ver20/XMLSchema'}
+STREAM_OVERRUN = timedelta(seconds=3)
 
 
 class Response:
@@ -71,7 +71,7 @@ class Dvr:
                                          data=data, headers=headers or {})
         return Response(self.opener.open(request, timeout=timeout))
 
-    def get(self, path, stream=False, timeout=20):
+    def get(self, path, timeout=20):
         return self._open(path, timeout=timeout)
 
     def post_xml(self, path, body, timeout=30):
@@ -83,6 +83,29 @@ class Dvr:
         root = ElementTree.fromstring(
             self.get('/ISAPI/System/deviceInfo', timeout=timeout).content)
         return {child.tag.split('}')[-1]: child.text for child in root}
+
+    def storage(self, timeout=10):
+        root = ElementTree.fromstring(
+            self.get('/ISAPI/ContentMgmt/Storage', timeout=timeout).content)
+        disks = []
+        for hdd in root.iter('{%s}hdd' % NS['h']):
+            field = {child.tag.split('}')[-1]: (child.text or '') for child in hdd}
+            disks.append({'id': field.get('id', '?'), 'status': field.get('status', 'unknown'),
+                          'capacity_mb': int(field.get('capacity') or 0),
+                          'free_mb': int(field.get('freeSpace') or 0),
+                          'property': field.get('property', '')})
+        mode = root.find('h:workMode', NS)
+        return disks, (mode.text if mode is not None else '')
+
+    def uptime(self, timeout=10):
+        root = ElementTree.fromstring(self.get('/ISAPI/System/status', timeout=timeout).content)
+        value = root.find('h:deviceUpTime', NS)
+        return int(value.text) if value is not None and value.text else None
+
+    def reboot(self, timeout=10):
+        request = urllib.request.Request('http://%s/ISAPI/System/reboot' % self.host,
+                                         data=b'', method='PUT')
+        return self.opener.open(request, timeout=timeout).status
 
     def snapshot(self, channel, timeout=20):
         return self.get('/ISAPI/Streaming/channels/%d01/picture' % channel,
@@ -109,20 +132,9 @@ class Dvr:
 
     def playback_url(self, channel, start, end):
         user, password = self._creds_in_url()
+        end = end + STREAM_OVERRUN
         return 'rtsp://%s:%s@%s:554/Streaming/tracks/%d01?starttime=%s&endtime=%s' % (
             user, password, self.ip, channel, _stamp(start), _stamp(end))
-
-    def search(self, channel, start, end, max_results=50):
-        body = SEARCH_BODY % (uuid.uuid4(), channel, _iso(start), _iso(end), max_results)
-        root = self.post_xml('/ISAPI/ContentMgmt/search', body)
-        segments = []
-        for item in root.iter('{%s}searchMatchItem' % NS['h']):
-            span = item.find('h:timeSpan', NS)
-            if span is None:
-                continue
-            segments.append((_parse(span.find('h:startTime', NS).text),
-                             _parse(span.find('h:endTime', NS).text)))
-        return segments
 
     def playback_segments(self, channel, start, end, max_results=400):
         body = SEARCH_BODY % (uuid.uuid4(), channel, _iso(start), _iso(end), max_results)
@@ -144,17 +156,6 @@ class Dvr:
         found = self.playback_segments(channel, start, datetime.now(), max_results=1)
         return found[0][0] if found else None
 
-    def download_stream(self, channel, name, start, end):
-        uri = ('rtsp://%s/Streaming/tracks/%d01/?starttime=%s&endtime=%s&name=%s&size=0'
-               % (self.ip, channel, _stamp(start), _stamp(end), name))
-        body = ('<?xml version="1.0" encoding="utf-8"?>'
-                '<downloadRequest version="1.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">'
-                '<playbackURI>%s</playbackURI></downloadRequest>' % uri.replace('&', '&amp;'))
-        request = urllib.request.Request(
-            'http://%s/ISAPI/ContentMgmt/download' % self.host,
-            data=body.encode('utf-8'), headers={'Content-Type': 'application/xml'})
-        return self.opener.open(request, timeout=30)
-
     def record_days(self, channel, year, month, sub=False):
         body = DAILY_BODY % (year, month)
         root = self.post_xml('/ISAPI/ContentMgmt/record/tracks/%d0%d/dailyDistribution' % (
@@ -168,22 +169,8 @@ class Dvr:
                 days.append((int(number.text), kind.text if kind is not None else 'time'))
         return days
 
-    def clip(self, channel, start, end, out_path):
-        import runtime
-        seconds = int((end - start).total_seconds())
-        if seconds <= 0:
-            raise ValueError('end must be after start')
-        cmd = (['ffmpeg', '-y']
-               + runtime.rtsp_input(self.playback_url(channel, start, end),
-                                    duration=seconds)
-               + ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '64k']
-               + runtime.aspect_args()
-               + ['-movflags', '+frag_keyframe+empty_moov', out_path])
-        subprocess.run(cmd, check=True, creationflags=runtime.NO_WINDOW)
-        return out_path
-
     def events(self, timeout=None, on_open=None):
-        resp = self.get('/ISAPI/Event/notification/alertStream', stream=True, timeout=timeout)
+        resp = self.get('/ISAPI/Event/notification/alertStream', timeout=timeout)
         if on_open is not None:
             on_open(resp)
         chunk = []
@@ -387,35 +374,3 @@ def _parse_stamp(text):
     except ValueError:
         return datetime.now()
 
-
-if __name__ == '__main__':
-    import config
-
-    saved = config.load()
-    if saved is None:
-        raise SystemExit('no saved DVR credentials, run the app once first')
-    dvr = Dvr(saved['ip'], saved['user'], saved['password'], saved['port'])
-    try:
-        dvr.device_info(timeout=5)
-    except Exception:
-        dvr = find_device(saved['user'], saved['password'],
-                          saved['serial'] or None, saved['ip'])
-        if dvr is None:
-            raise SystemExit('no DVR answered on this network')
-        print('moved to %s' % dvr.ip)
-    info = dvr.device_info()
-    print('%s  %s  fw %s' % (info.get('model'), info.get('deviceType'), info.get('firmwareVersion')))
-
-    live = dvr.live_channels()
-    print('live channels: %s' % live)
-
-    end = datetime.now() - timedelta(minutes=5)
-    start = end - timedelta(hours=2)
-    for channel in live[:1]:
-        found = dvr.search(channel, start, end)
-        print('ch%d recordings in last 2h: %s' % (channel, [
-            '%s -> %s' % (a.strftime('%H:%M:%S'), b.strftime('%H:%M:%S')) for a, b in found]))
-
-    now = datetime.now()
-    days = dvr.record_days(live[0], now.year, now.month)
-    print('days with footage this month: %s' % [d for d, _ in days])

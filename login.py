@@ -1,28 +1,10 @@
-import os
-
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QVBoxLayout)
 
 import config
 import hik
-
-DIALOG_STYLE = """
-QDialog { background:#101014; }
-QLabel { color:#b0b0c0; font-size:12px; }
-QLineEdit { background:#1b1b22; color:#e0e0ea; border:1px solid #2c2c36;
-            padding:5px 7px; font-size:12px; }
-QLineEdit:focus { border-color:#4d7fb8; }
-QComboBox { background:#1b1b22; color:#e0e0ea; border:1px solid #2c2c36;
-            padding:4px 7px; font-size:12px; }
-QComboBox QAbstractItemView { background:#1b1b22; color:#e0e0ea;
-                              selection-background-color:#2b4a34; }
-QCheckBox { color:#9a9aa8; font-size:11px; }
-QPushButton { background:#1b1b22; color:#c8c8d4; border:1px solid #2c2c36;
-              padding:6px 16px; font-size:12px; }
-QPushButton:hover { background:#24242e; }
-QPushButton:default { background:#2b4a34; border-color:#3d6b4a; color:#9fe8bd; }
-"""
+import theme
 
 
 class ProbeWorker(QThread):
@@ -66,7 +48,6 @@ class LoginDialog(QDialog):
     def __init__(self, initial=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Connect to DVR')
-        self.setStyleSheet(DIALOG_STYLE)
         self.setMinimumWidth(380)
         self.result_credentials = None
         self.probe = None
@@ -95,7 +76,7 @@ class LoginDialog(QDialog):
 
         self.test_button = QPushButton('Test')
         self.test_button.clicked.connect(self.run_test)
-        self.connect_button = QPushButton('Connect')
+        self.connect_button = theme.set_role(QPushButton('Connect'), 'primary')
         self.connect_button.setDefault(True)
         self.connect_button.clicked.connect(self.accept_credentials)
         cancel = QPushButton('Cancel')
@@ -200,17 +181,8 @@ def remember(dvr, saved):
         pass
 
 
-def obtain_dvr(folder, on_prompt=None):
+def obtain_dvr():
     saved = config.load()
-    if saved is None:
-        legacy = config.import_legacy(folder)
-        if legacy is not None:
-            try:
-                hik.Dvr(legacy['ip'], legacy['user'], legacy['password']).device_info()
-                config.save(legacy['ip'], legacy['user'], legacy['password'])
-                saved = legacy
-            except Exception:
-                saved = None
     if saved is not None:
         if hik.port_open(saved['ip'], saved.get('port', 80), 0.8):
             try:
@@ -227,8 +199,6 @@ def obtain_dvr(folder, on_prompt=None):
         if found is not None:
             remember(found, saved)
             return found
-    if on_prompt is not None:
-        on_prompt()
     dialog = LoginDialog(saved)
     if dialog.exec() != QDialog.Accepted or dialog.result_credentials is None:
         return None

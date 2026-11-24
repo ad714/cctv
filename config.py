@@ -121,7 +121,9 @@ def _read():
 
 
 def save(ip, user, password, channels=None, serial=None, port=80):
-    payload = {'ip': ip, 'user': user, 'secret': protect(password)}
+    payload = {key: value for key, value in (_read() or {}).items()
+               if key not in ('ip', 'user', 'secret', 'channels', 'serial', 'port')}
+    payload.update({'ip': ip, 'user': user, 'secret': protect(password)})
     if channels:
         payload['channels'] = list(channels)
     if serial:
@@ -137,6 +139,21 @@ def setting(name, default=None):
     return default if value in (None, '') else value
 
 
+def set_setting(name, value):
+    data = _read()
+    if data is None:
+        return False
+    data[name] = value
+    _write(data)
+    return True
+
+
+def thumbs_dir():
+    path = data_path('thumbs')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def remember_channels(channels):
     data = _read()
     if data is None or data.get('channels') == list(channels):
@@ -144,28 +161,3 @@ def remember_channels(channels):
     data['channels'] = list(channels)
     _write(data)
     return True
-
-
-def forget():
-    try:
-        os.remove(config_path())
-        return True
-    except OSError:
-        return False
-
-
-def import_legacy(folder):
-    path = os.path.join(folder, '.hikenv')
-    if not os.path.exists(path):
-        return None
-    values = {}
-    with open(path, encoding='utf-8-sig') as handle:
-        for line in handle:
-            if '=' in line and not line.strip().startswith('#'):
-                key, _, value = line.partition('=')
-                values[key.strip()] = value.strip().strip('"').strip("'")
-    if not values.get('HIK_PASS'):
-        return None
-    return {'ip': values.get('HIK_IP', '192.168.1.6'),
-            'user': values.get('HIK_USER', 'admin'),
-            'password': values['HIK_PASS']}
